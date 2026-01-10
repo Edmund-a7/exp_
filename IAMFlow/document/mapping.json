@@ -1,0 +1,72 @@
+{
+    "global_registry": {
+        "1": {
+            "name": "man_1",
+            "all_entities": ["young man", "protagonist"],
+            "all_attrs": ["late 20s", "messy black hair", "denim jacket", "seated on bench", "holding sketchbook"],
+            "instances": [
+                {
+                    "prompt_id": 1,
+                    "entity": "young man",
+                    "attrs": ["late 20s", "messy black hair", "denim jacket", "holding sketchbook"]
+                },
+                {
+                    "prompt_id": 2,
+                    "entity": "protagonist",
+                    "attrs": ["denim jacket", "seated on bench"]
+                }
+            ]
+        },
+        "2": {
+            "name": "man_2",
+            "all_entities": ["another man", "man in grey sweater"],
+            "all_attrs": ["around 30 years old", "wearing glasses", "grey sweater", "holding coffee cup"],
+            "instances": [
+                {
+                    "prompt_id": 2,
+                    "entity": "another man",
+                    "attrs": ["around 30 years old", "wearing glasses", "grey sweater", "holding coffee cup"]
+                }
+            ]
+        },
+        "3": {
+            "name": "woman_1",
+            "all_entities": ["young woman", "woman in white dress"],
+            "all_attrs": ["late 20s", "long hair", "white dress", "carrying shoulder bag"],
+            "instances": [
+                {
+                    "prompt_id": 3,
+                    "entity": "young woman",
+                    "attrs": ["late 20s", "long hair", "white dress", "carrying shoulder bag"]
+                }
+            ]
+        }
+    },
+    "frame_archive": {
+        "p1_c3_f0": {
+            "frame_path": "data/p1_c3_f0.pt",
+            "prompt_id": 1,
+            "associated_entities": ["1"],
+            "score": 0.91
+        },
+        "p1_c7_f2": {
+            "frame_path": "data/p1_c7_f2.pt",
+            "prompt_id": 1,
+            "associated_entities": ["1"],
+            "score": 0.88
+        },
+        "p2_c5_f1": {
+            "frame_path": "data/p2_c5_f1.pt",
+            "prompt_id": 2,
+            "associated_entities": ["1", "2"],
+            "score": 0.93
+        },
+        "p3_c4_f0": {
+            "frame_path": "data/p3_c4_f0.pt",
+            "prompt_id": 3,
+            "associated_entities": ["1", "2", "3"],
+            "score": 0.90
+        }
+    },
+    "frame_active_memory": ["p2_c5_f1", "p1_c3_f0", "p3_c4_f0"]
+}

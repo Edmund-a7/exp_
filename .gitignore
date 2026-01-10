@@ -1,0 +1,33 @@
+benchmark_results/
+
+# model weights and large artifacts
+**/checkpoints/
+**/wan_models/
+**/longlive_models/
+**/Qwen3-4B-Instruct-2507/
+**/outputs/
+**/runs/
+**/logs/
+**/wandb/
+**/.ipynb_checkpoints/
+**/__pycache__/
+
+# common weight file extensions
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.npz
+*.onnx
+*.tar
+*.tar.gz
+*.zip
+*.rar
+
+# temp files
+*.log
+*.tmp
+MemFlow/prompts/vidprom_filtered_extended_switch.txt
+MemFlow/prompts/vidprom_filtered_extended.txt
+MemFlow/prompts/vidprom_filtered_extended*.txt
