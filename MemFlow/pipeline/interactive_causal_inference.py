@@ -107,6 +107,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         switch_frame_indices: List[int],
         return_latents: bool = False,
         low_memory: bool = False,
+        profile: bool = False,
     ):
         """Generate a video and switch prompts at specified frame indices.
 
@@ -126,7 +127,29 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         assert num_output_frames % self.num_frame_per_block == 0
         num_blocks = num_output_frames // self.num_frame_per_block
 
-        
+        # ===== Profiling Setup =====
+        if profile:
+            init_start = torch.cuda.Event(enable_timing=True)
+            init_end = torch.cuda.Event(enable_timing=True)
+            diffusion_start = torch.cuda.Event(enable_timing=True)
+            diffusion_end = torch.cuda.Event(enable_timing=True)
+            vae_start = torch.cuda.Event(enable_timing=True)
+            vae_end = torch.cuda.Event(enable_timing=True)
+            block_start = torch.cuda.Event(enable_timing=True)
+            block_end = torch.cuda.Event(enable_timing=True)
+
+            # MemFlow specific timers
+            recache_start = torch.cuda.Event(enable_timing=True)
+            recache_end = torch.cuda.Event(enable_timing=True)
+            bank_start = torch.cuda.Event(enable_timing=True)
+            bank_end = torch.cuda.Event(enable_timing=True)
+
+            block_times = []
+            recache_times = []  # Per-prompt recache time
+            bank_times = []  # Per-chunk NAM bank update time
+
+            init_start.record()
+
         # encode all prompts
         print(text_prompts_list)
         cond_list = [self.text_encoder(text_prompts=p) for p in text_prompts_list]
@@ -180,6 +203,11 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         print(f"[inference] local_attn_size set on model: {self.generator.model.local_attn_size}")
         self._set_all_modules_max_attention_size(self.local_attn_size)
 
+        if profile:
+            init_end.record()
+            torch.cuda.synchronize()
+            diffusion_start.record()
+
         # temporal denoising by blocks
         all_num_frames = [self.num_frame_per_block] * num_blocks
         segment_idx = 0  # current segment index
@@ -193,7 +221,10 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             print("[MultipleSwitch] all_num_frames", all_num_frames)
             print("[MultipleSwitch] switch_frame_indices", switch_frame_indices)
 
-        for current_num_frames in all_num_frames:
+        for block_idx, current_num_frames in enumerate(all_num_frames):
+            if profile:
+                block_start.record()
+
             if (current_start_frame)%(3*self.record_interval)==0:
                 update_bank=True
             else:
@@ -201,7 +232,18 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             
             if next_switch_pos is not None and current_start_frame >= next_switch_pos:
                 segment_idx += 1
+
+                if profile:
+                    recache_start.record()
+
                 self._recache_after_switch(output, current_start_frame, cond_list[segment_idx])
+
+                if profile:
+                    recache_end.record()
+                    torch.cuda.synchronize()
+                    recache_time = recache_start.elapsed_time(recache_end)
+                    recache_times.append((f"Prompt {segment_idx + 1}", recache_time))
+
                 if DEBUG:
                     print(
                         f"[MultipleSwitch] Switch to segment {segment_idx} at frame {current_start_frame}"
@@ -272,6 +314,10 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
 
             # rerun with clean context to update cache
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
+
+            if profile and update_bank:
+                bank_start.record()
+
             self.generator(
                 noisy_image_or_video=denoised_pred,
                 conditional_dict=cond_in_use,
@@ -285,13 +331,101 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 update_cache=True,
             )
 
+            if profile and update_bank:
+                bank_end.record()
+                torch.cuda.synchronize()
+                bank_time = bank_start.elapsed_time(bank_end)
+                bank_times.append((f"Block {block_idx}", bank_time))
+
+            if profile:
+                block_end.record()
+                torch.cuda.synchronize()
+                block_time = block_start.elapsed_time(block_end)
+                block_times.append(block_time)
+
             # Update frame pointer
             current_start_frame += current_num_frames
+
+        if profile:
+            diffusion_end.record()
+            torch.cuda.synchronize()
+            diffusion_time = diffusion_start.elapsed_time(diffusion_end)
+            init_time = init_start.elapsed_time(init_end)
+            vae_start.record()
 
         # Standard decoding
         video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False)
         video = (video * 0.5 + 0.5).clamp(0, 1)
+
+        if profile:
+            vae_end.record()
+            torch.cuda.synchronize()
+            vae_time = vae_start.elapsed_time(vae_end)
+
         self.clear_kv_cache()
+
+        # ===== Profiling Results =====
+        if profile:
+            total_time = init_time + diffusion_time + vae_time
+            total_recache_time = sum(t for _, t in recache_times)
+            total_bank_time = sum(t for _, t in bank_times)
+
+            print("\n" + "=" * 70)
+            print("MemFlow Pipeline Profiling Results")
+            print("=" * 70)
+
+            # Overall breakdown
+            print(f"\n[Overall Performance]")
+            print(f"  - Initialization time:     {init_time:8.2f} ms ({100 * init_time / total_time:5.2f}%)")
+            print(f"  - Diffusion generation:    {diffusion_time:8.2f} ms ({100 * diffusion_time / total_time:5.2f}%)")
+            print(f"  - VAE decoding:            {vae_time:8.2f} ms ({100 * vae_time / total_time:5.2f}%)")
+            print(f"  - Total time:              {total_time:8.2f} ms")
+            print(f"  - Throughput:              {num_output_frames / (total_time / 1000):8.2f} FPS")
+
+            # MemFlow-specific breakdown
+            print(f"\n[MemFlow Components (within diffusion)]")
+            print(f"  - Total Recache time:      {total_recache_time:8.2f} ms ({100 * total_recache_time / diffusion_time:5.2f}% of diffusion)")
+            print(f"  - Total NAM Bank time:     {total_bank_time:8.2f} ms ({100 * total_bank_time / diffusion_time:5.2f}% of diffusion)")
+            print(f"  - Pure diffusion time:     {diffusion_time - total_recache_time - total_bank_time:8.2f} ms ({100 * (diffusion_time - total_recache_time - total_bank_time) / diffusion_time:5.2f}% of diffusion)")
+
+            # Per-prompt recache time
+            if recache_times:
+                print(f"\n[Recache - Per Prompt Switch]")
+                for prompt_name, time_ms in recache_times:
+                    print(f"  - {prompt_name:12s} recache:    {time_ms:8.2f} ms")
+
+            # Per-block NAM bank update time
+            if bank_times:
+                print(f"\n[NAM Bank Update - Per Block]")
+                if len(bank_times) <= 10:
+                    for block_name, time_ms in bank_times:
+                        print(f"  - {block_name:12s} update:     {time_ms:8.2f} ms")
+                else:
+                    for block_name, time_ms in bank_times[:5]:
+                        print(f"  - {block_name:12s} update:     {time_ms:8.2f} ms")
+                    print(f"  - ... ({len(bank_times) - 10} blocks omitted)")
+                    for block_name, time_ms in bank_times[-5:]:
+                        print(f"  - {block_name:12s} update:     {time_ms:8.2f} ms")
+                if bank_times:
+                    avg_bank_time = total_bank_time / len(bank_times)
+                    print(f"  - Average per update:      {avg_bank_time:8.2f} ms")
+
+            # Per-block diffusion time
+            print(f"\n[Diffusion - Per Block]")
+            if len(block_times) <= 10:
+                for i, block_time in enumerate(block_times):
+                    print(f"  - Block {i:3d} generation:   {block_time:8.2f} ms ({100 * block_time / diffusion_time:5.2f}% of diffusion)")
+            else:
+                for i in range(5):
+                    print(f"  - Block {i:3d} generation:   {block_times[i]:8.2f} ms ({100 * block_times[i] / diffusion_time:5.2f}% of diffusion)")
+                print(f"  - ... ({len(block_times) - 10} blocks omitted)")
+                for i in range(len(block_times) - 5, len(block_times)):
+                    print(f"  - Block {i:3d} generation:   {block_times[i]:8.2f} ms ({100 * block_times[i] / diffusion_time:5.2f}% of diffusion)")
+            avg_block_time = diffusion_time / len(block_times)
+            print(f"  - Average per block:       {avg_block_time:8.2f} ms")
+
+            print("=" * 70 + "\n")
+
         if return_latents:
             return video, output
         return video 
