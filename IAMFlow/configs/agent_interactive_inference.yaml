@@ -16,7 +16,8 @@ model_kwargs:
   sink_size: 3
   bank_size: 3
   record_interval: 3
-  SMA: False  # IAM replaces MemFlow's SMA
+  SMA: True  # 启用稀疏注意力 (Sink保留, Bank+Local稀疏化)
+  sparse_top_k: 6  # 从 Bank+Local 中选择 top-6 帧
 
 # Inference
 data_path: prompts/interactive_example.jsonl

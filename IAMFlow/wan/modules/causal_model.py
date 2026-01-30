@@ -72,7 +72,8 @@ class CausalWanSelfAttention(nn.Module):
                  qk_norm=True,
                  eps=1e-6,
                  record_interval=3,
-                 SMA=False):
+                 SMA=False,
+                 sparse_top_k=6):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -84,6 +85,7 @@ class CausalWanSelfAttention(nn.Module):
         self.eps = eps
         self.record_interval = record_interval
         self.SMA = SMA
+        self.sparse_top_k = sparse_top_k
 
         # Support list/tuple local_attn_size by converting to list first (handles OmegaConf ListConfig)
         if not isinstance(local_attn_size, int) and hasattr(local_attn_size, "__iter__"):
@@ -101,8 +103,64 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    # IAM: dynamic_topk_routing_attention (SMA) 已删除
-    # 由 IAM 的 entity-based 帧选择替代
+    # IAM: Sparse Attention via Top-K Routing
+    def dynamic_topk_routing_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        chunk_size: int,
+        top_k: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        动态稀疏注意力：基于 top-k chunk routing
+
+        Args:
+            query: [B, L_q, H, D]
+            key: [B, L_kv, H, D]
+            value: [B, L_kv, H, D]
+            chunk_size: 每个 chunk 的大小 (1560 = 1帧)
+            top_k: 选择的 chunk 数量
+
+        Returns:
+            (k_selected, v_selected): 选中的 K, V tensors
+        """
+        B, L_q, H, D = query.shape
+        _, L_kv, _, _ = key.shape
+
+        # 1. 分块
+        assert L_kv % chunk_size == 0, f"L_kv {L_kv} must be divisible by chunk_size {chunk_size}"
+        num_chunks = L_kv // chunk_size
+
+        key_chunks = key.view(B, num_chunks, chunk_size, H, D)
+        value_chunks = value.view(B, num_chunks, chunk_size, H, D)
+
+        # 2. 计算粗粒度分数 (mean pooling)
+        phi_q = query.mean(dim=1, keepdim=True).permute(0, 2, 1, 3)  # [B, H, 1, D]
+        phi_k = key_chunks.mean(dim=2).permute(0, 2, 1, 3)  # [B, H, num_chunks, D]
+
+        # 3. 相关性分数
+        scores = torch.matmul(phi_q, phi_k.transpose(-2, -1)).squeeze(2)  # [B, H, num_chunks]
+
+        # 4. Top-K 选择
+        k_selected = min(top_k, num_chunks)
+        _, top_k_indices = torch.topk(scores, k=k_selected, dim=-1)  # [B, H, k_selected]
+        top_k_indices_sorted, _ = torch.sort(top_k_indices, dim=-1)
+
+        # 5. Gather 选中的 chunks
+        key_chunks_p = key_chunks.permute(0, 3, 1, 2, 4)  # [B, H, num_chunks, chunk_size, D]
+        value_chunks_p = value_chunks.permute(0, 3, 1, 2, 4)
+
+        expanded_idx = top_k_indices_sorted.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, chunk_size, D)
+        selected_k = torch.gather(key_chunks_p, 2, expanded_idx)  # [B, H, k_selected, chunk_size, D]
+        selected_v = torch.gather(value_chunks_p, 2, expanded_idx)
+
+        # 6. Reshape 回 [B, L, H, D]
+        L_selected = k_selected * chunk_size
+        final_k = selected_k.reshape(B, H, L_selected, D).permute(0, 2, 1, 3)
+        final_v = selected_v.reshape(B, H, L_selected, D).permute(0, 2, 1, 3)
+
+        return final_k, final_v
 
     def forward(
         self,
@@ -385,9 +443,26 @@ class CausalWanSelfAttention(nn.Module):
 
                     k_bank = bank_k[:, :local_end_index_bank_]
                     v_bank = bank_v[:, :local_end_index_bank_]
-                    # IAM: SMA (dynamic_topk_routing_attention) 已删除，直接拼接 k_bank
-                    k_cat = torch.cat([k_sink, k_bank, k_local], dim=1)
-                    v_cat = torch.cat([v_sink, v_bank, v_local], dim=1)
+
+                    # IAM: 稀疏注意力 (SMA=True 时启用)
+                    if self.SMA and k_bank.shape[1] > 0 and k_local.shape[1] > 0:
+                        # Sink 保留，Bank + Local 稀疏化
+                        k_candidates = torch.cat([k_bank, k_local], dim=1)
+                        v_candidates = torch.cat([v_bank, v_local], dim=1)
+
+                        k_sparse, v_sparse = self.dynamic_topk_routing_attention(
+                            query=roped_query,
+                            key=k_candidates,
+                            value=v_candidates,
+                            chunk_size=frame_seqlen,
+                            top_k=self.sparse_top_k
+                        )
+                        k_cat = torch.cat([k_sink, k_sparse], dim=1)
+                        v_cat = torch.cat([v_sink, v_sparse], dim=1)
+                    else:
+                        # 原始: 直接拼接
+                        k_cat = torch.cat([k_sink, k_bank, k_local], dim=1)
+                        v_cat = torch.cat([v_sink, v_bank, v_local], dim=1)
 
                 else:
                     k_cat = k_sink
@@ -432,7 +507,8 @@ class CausalWanAttentionBlock(nn.Module):
                  cross_attn_norm=False,
                  eps=1e-6,
                  record_interval=3,
-                 SMA=False):
+                 SMA=False,
+                 sparse_top_k=6):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -444,7 +520,7 @@ class CausalWanAttentionBlock(nn.Module):
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps, record_interval, SMA)
+        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps, record_interval, SMA, sparse_top_k)
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -591,6 +667,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  bank_size=3,
                  record_interval=3,
                  SMA=False,
+                 sparse_top_k=6,
                  qk_norm=True,
                  cross_attn_norm=True,
                  eps=1e-6):
@@ -669,7 +746,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
         self.blocks = nn.ModuleList([
             CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
-                                    local_attn_size, sink_size, bank_size, qk_norm, cross_attn_norm, eps, record_interval, SMA)
+                                    local_attn_size, sink_size, bank_size, qk_norm, cross_attn_norm, eps, record_interval, SMA, sparse_top_k)
             for _ in range(num_layers)
         ])
 
