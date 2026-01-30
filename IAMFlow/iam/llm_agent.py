@@ -46,18 +46,59 @@ class EntityStruct:
 
 
 class LLMWrapper:
-    """LLM封装类，支持多种模型"""
+    """LLM封装类，支持 HuggingFace Transformers 和 vLLM 两种后端"""
 
-    def __init__(self, model_path: str = "../Qwen3-0.6B", device: str = None):
+    def __init__(self, model_path: str = "../Qwen3-0.6B", device: str = None, use_vllm: bool = True):
+        """
+        初始化 LLM 封装类
+
+        Args:
+            model_path: 模型路径
+            device: 设备 (仅 HF 后端使用)
+            use_vllm: 是否使用 vLLM 后端 (默认 True，更快)
+        """
         self.model_path = model_path
         self._model = None
         self._tokenizer = None
         self._device = device
+        self._use_vllm = use_vllm
+        self._sampling_params = None
 
     def _load_model(self):
         if self._model is not None:
             return
 
+        if self._use_vllm:
+            self._load_vllm_model()
+        else:
+            self._load_hf_model()
+
+    def _load_vllm_model(self):
+        """使用 vLLM 加载模型"""
+        try:
+            from vllm import LLM, SamplingParams
+
+            print(f"[LLMWrapper] Loading model with vLLM from {self.model_path}")
+
+            self._model = LLM(
+                model=self.model_path,
+                trust_remote_code=True,
+                dtype="bfloat16",
+                gpu_memory_utilization=0.3,  # 限制显存使用，给 diffusion 模型留空间
+                max_model_len=2048,
+            )
+            self._tokenizer = self._model.get_tokenizer()
+            self._sampling_params = SamplingParams
+
+            print(f"[LLMWrapper] vLLM model loaded successfully")
+
+        except ImportError:
+            print(f"[LLMWrapper] vLLM not installed, falling back to HuggingFace")
+            self._use_vllm = False
+            self._load_hf_model()
+
+    def _load_hf_model(self):
+        """使用 HuggingFace Transformers 加载模型"""
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -68,7 +109,7 @@ class LLMWrapper:
                 else "cpu"
             )
 
-        print(f"[LLMWrapper] Loading model from {self.model_path} on {self._device}")
+        print(f"[LLMWrapper] Loading model with HuggingFace from {self.model_path} on {self._device}")
 
         self._tokenizer = AutoTokenizer.from_pretrained(
             self.model_path,
@@ -83,7 +124,7 @@ class LLMWrapper:
         if self._device != "cuda":
             self._model = self._model.to(self._device)
 
-        print(f"[LLMWrapper] Model loaded successfully")
+        print(f"[LLMWrapper] HuggingFace model loaded successfully")
 
     def generate(self, system_prompt: str, user_prompt: str,
                  max_new_tokens: int = 1024,
@@ -96,7 +137,7 @@ class LLMWrapper:
             {"role": "user", "content": user_prompt},
         ]
 
-        # 兼容不同模型的 chat template
+        # 构建 prompt
         try:
             text = self._tokenizer.apply_chat_template(
                 messages,
@@ -105,14 +146,32 @@ class LLMWrapper:
                 enable_thinking=False
             )
         except TypeError:
-            # 某些模型不支持 enable_thinking 参数
             text = self._tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True
             )
 
-        model_inputs = self._tokenizer([text], return_tensors="pt").to(self._model.device)
+        if self._use_vllm:
+            return self._generate_vllm(text, max_new_tokens, temperature)
+        else:
+            return self._generate_hf(text, max_new_tokens, temperature)
+
+    def _generate_vllm(self, prompt: str, max_new_tokens: int, temperature: float) -> str:
+        """使用 vLLM 生成"""
+        sampling_params = self._sampling_params(
+            max_tokens=max_new_tokens,
+            temperature=temperature if temperature > 0 else 0.01,
+            top_p=0.9,
+        )
+
+        outputs = self._model.generate([prompt], sampling_params)
+        response = outputs[0].outputs[0].text.strip()
+        return response
+
+    def _generate_hf(self, prompt: str, max_new_tokens: int, temperature: float) -> str:
+        """使用 HuggingFace 生成"""
+        model_inputs = self._tokenizer([prompt], return_tensors="pt").to(self._model.device)
 
         generated_ids = self._model.generate(
             **model_inputs,
@@ -125,7 +184,6 @@ class LLMWrapper:
 
         output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
         response = self._tokenizer.decode(output_ids, skip_special_tokens=True).strip()
-
         return response
 
 
@@ -416,9 +474,9 @@ class LLMAgent:
     3. 返回实体列表和registry更新信息
     """
 
-    def __init__(self, model_path: str = "../Qwen3-0.6B"):
+    def __init__(self, model_path: str = "../Qwen3-0.6B", use_vllm: bool = True):
         # 共享同一个LLM实例
-        self.llm = LLMWrapper(model_path)
+        self.llm = LLMWrapper(model_path, use_vllm=use_vllm)
         self.extractor = EntityStructExtractor(llm=self.llm)
         self.id_manager = GlobalIDManager(llm=self.llm)
 

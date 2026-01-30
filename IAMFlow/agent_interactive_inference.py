@@ -108,6 +108,7 @@ llm_model_path = args.llm_model_path if args.llm_model_path != "../Qwen3-0.6B" e
 max_memory_frames = args.max_memory_frames if args.max_memory_frames != 3 else getattr(config, "max_memory_frames", 3)
 save_dir = args.save_dir if args.save_dir != "data/agent_frames" else getattr(config, "save_dir", "data/agent_frames")
 save_frames_to_disk = args.save_frames_to_disk or getattr(config, "save_frames_to_disk", False)
+use_vllm = getattr(config, "use_vllm", True)  # 默认使用 vLLM
 
 if local_rank == 0:
     print("=" * 60)
@@ -117,6 +118,7 @@ if local_rank == 0:
     print(f"Max Memory Frames: {max_memory_frames}")
     print(f"Save Directory: {save_dir}")
     print(f"Save Frames to Disk: {save_frames_to_disk}")
+    print(f"Use vLLM: {use_vllm}")
     print("=" * 60)
 
 pipeline = AgentCausalInferencePipeline(
@@ -125,7 +127,8 @@ pipeline = AgentCausalInferencePipeline(
     llm_model_path=llm_model_path,
     max_memory_frames=max_memory_frames,
     save_dir=save_dir,
-    save_frames_to_disk=save_frames_to_disk
+    save_frames_to_disk=save_frames_to_disk,
+    use_vllm=use_vllm
 )
 
 # ----------------------------- Load base checkpoint -----------------------------

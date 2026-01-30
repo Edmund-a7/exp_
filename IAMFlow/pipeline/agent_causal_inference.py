@@ -52,7 +52,8 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         llm_model_path: str = "../Qwen3-0.6B",
         max_memory_frames: int = 3,
         save_dir: str = "data/agent_frames",
-        save_frames_to_disk: bool = False
+        save_frames_to_disk: bool = False,
+        use_vllm: bool = True
     ):
         """
         初始化 Agent Pipeline
@@ -67,11 +68,12 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             max_memory_frames: 最大记忆帧数量
             save_dir: 帧数据保存目录
             save_frames_to_disk: 是否将帧 KV 保存到磁盘 (默认False，仅保存在内存中以提升性能)
+            use_vllm: 是否使用 vLLM 加速 (默认True)
         """
         super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae)
 
         # 初始化 LLM Agent
-        self.llm_agent = LLMAgent(model_path=llm_model_path)
+        self.llm_agent = LLMAgent(model_path=llm_model_path, use_vllm=use_vllm)
 
         # 初始化 Memory Bank (使用父类的 text_encoder)
         self.agent_memory_bank = MemoryBank(
@@ -743,7 +745,8 @@ def create_agent_pipeline(
     device: torch.device,
     llm_model_path: str = "../Qwen3-0.6B",
     max_memory_frames: int = 3,
-    save_dir: str = "data/agent_frames"
+    save_dir: str = "data/agent_frames",
+    use_vllm: bool = True
 ) -> AgentCausalInferencePipeline:
     """
     创建 Agent Pipeline 的便捷函数
@@ -754,6 +757,7 @@ def create_agent_pipeline(
         llm_model_path: LLM 模型路径
         max_memory_frames: 最大记忆帧数
         save_dir: 帧保存目录
+        use_vllm: 是否使用 vLLM 加速
 
     Returns:
         AgentCausalInferencePipeline 实例
@@ -763,7 +767,8 @@ def create_agent_pipeline(
         device=device,
         llm_model_path=llm_model_path,
         max_memory_frames=max_memory_frames,
-        save_dir=save_dir
+        save_dir=save_dir,
+        use_vllm=use_vllm
     )
     return pipeline
 
