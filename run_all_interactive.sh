@@ -56,11 +56,10 @@ CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=29501 \
     --lora_ckpt "${MEMFLOW_LORA}" \
     --seed ${SEED}
 
-# IAMFlow
+# IAMFlow (使用 python 而非 torchrun，避免与 vLLM 分布式环境冲突)
 echo "[3/3] Running IAMFlow..."
 cd "${PROJECT_ROOT}/IAMFlow"
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=29502 \
-    agent_interactive_inference.py \
+CUDA_VISIBLE_DEVICES=0 python agent_interactive_inference.py \
     --config_path configs/agent_interactive_inference.yaml \
     --data_path "${INPUT_PROMPTS}" \
     --output_folder "${OUTPUT_DIR}/iamflow" \
