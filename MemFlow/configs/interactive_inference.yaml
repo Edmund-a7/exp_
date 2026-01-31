@@ -13,7 +13,7 @@ model_kwargs:
   sink_size: 3
   bank_size: 3
   record_interval: 3
-  SMA: False
+  SMA: True
 
 # Inference
 data_path: prompts/interactive_example.jsonl
