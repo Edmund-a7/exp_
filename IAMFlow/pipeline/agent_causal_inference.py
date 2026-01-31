@@ -100,6 +100,9 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         # 确保保存目录存在
         os.makedirs(save_dir, exist_ok=True)
 
+        # 预加载 LLM 模型，避免第一次推理时的加载延迟影响 profiling
+        self.llm_agent.preload()
+
         # IAM: MemFlow 的 NAM 和 SMA 代码已从 causal_model.py 中删除
         # 不再需要禁用标志
 

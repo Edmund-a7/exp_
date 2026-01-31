@@ -64,6 +64,10 @@ class LLMWrapper:
         self._use_vllm = use_vllm
         self._sampling_params = None
 
+    def preload(self):
+        """预加载模型，避免第一次 generate 时的加载延迟"""
+        self._load_model()
+
     def _load_model(self):
         if self._model is not None:
             return
@@ -479,6 +483,12 @@ class LLMAgent:
         self.llm = LLMWrapper(model_path, use_vllm=use_vllm)
         self.extractor = EntityStructExtractor(llm=self.llm)
         self.id_manager = GlobalIDManager(llm=self.llm)
+
+    def preload(self):
+        """预加载 LLM 模型，避免第一次推理时的加载延迟"""
+        print("[LLMAgent] Preloading LLM model...")
+        self.llm.preload()
+        print("[LLMAgent] LLM model preloaded")
 
     def process_prompt(self,
                        prompt: str,
