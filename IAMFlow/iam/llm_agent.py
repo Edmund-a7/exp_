@@ -65,8 +65,23 @@ class LLMWrapper:
         self._sampling_params = None
 
     def preload(self):
-        """预加载模型，避免第一次 generate 时的加载延迟"""
+        """预加载模型并执行 warmup，避免第一次 generate 时的延迟"""
         self._load_model()
+        # Warmup: 执行一次空推理，让所有初始化完成
+        if self._use_vllm and self._model is not None:
+            print("[LLMWrapper] Running warmup inference...")
+            warmup_prompt = "Hello"
+            try:
+                text = self._tokenizer.apply_chat_template(
+                    [{"role": "user", "content": warmup_prompt}],
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                sampling_params = self._sampling_params(max_tokens=1, temperature=0.01)
+                _ = self._model.generate([text], sampling_params)
+                print("[LLMWrapper] Warmup complete")
+            except Exception as e:
+                print(f"[LLMWrapper] Warmup failed (non-critical): {e}")
 
     def _load_model(self):
         if self._model is not None:
