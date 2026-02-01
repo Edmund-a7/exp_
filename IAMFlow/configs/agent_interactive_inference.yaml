@@ -16,8 +16,7 @@ model_kwargs:
   sink_size: 3
   bank_size: 3
   record_interval: 3
-  SMA: False  # 禁用稀疏注意力
-  sparse_top_k: 6  # (SMA=False时不生效)
+  SMA: True  # 与 MemFlow 保持一致
 
 # Inference
 data_path: prompts/interactive_example.jsonl
