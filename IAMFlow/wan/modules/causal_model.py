@@ -444,21 +444,21 @@ class CausalWanSelfAttention(nn.Module):
                     k_bank = bank_k[:, :local_end_index_bank_]
                     v_bank = bank_v[:, :local_end_index_bank_]
 
-                    # IAM: 稀疏注意力 (SMA=True 时启用)
-                    if self.SMA and k_bank.shape[1] > 0 and k_local.shape[1] > 0:
-                        # Sink 保留，Bank + Local 稀疏化
-                        k_candidates = torch.cat([k_bank, k_local], dim=1)
-                        v_candidates = torch.cat([v_bank, v_local], dim=1)
+                    # SMA: 稀疏注意力 (与 MemFlow 保持一致)
+                    if self.SMA:
+                        # Sink + Bank 稀疏化，Local 保留全部
+                        k_global = torch.cat([k_sink, k_bank], dim=1)
+                        v_global = torch.cat([v_sink, v_bank], dim=1)
 
-                        k_sparse, v_sparse = self.dynamic_topk_routing_attention(
+                        k_global, v_global = self.dynamic_topk_routing_attention(
                             query=roped_query,
-                            key=k_candidates,
-                            value=v_candidates,
-                            chunk_size=frame_seqlen,
-                            top_k=self.sparse_top_k
+                            key=k_global,
+                            value=v_global,
+                            chunk_size=1560,
+                            top_k=3
                         )
-                        k_cat = torch.cat([k_sink, k_sparse], dim=1)
-                        v_cat = torch.cat([v_sink, v_sparse], dim=1)
+                        k_cat = torch.cat([k_global, k_local], dim=1)
+                        v_cat = torch.cat([v_global, v_local], dim=1)
                     else:
                         # 原始: 直接拼接
                         k_cat = torch.cat([k_sink, k_bank, k_local], dim=1)
