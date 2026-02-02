@@ -175,6 +175,7 @@ class CausalWanSelfAttention(nn.Module):
         kv_bank=None,
         update_bank=None,
         is_recache=None,
+        iam_bank_length=0,  # P0 优化: 避免在 forward 中调用 .item()
     ):
         r"""
         Args:
@@ -297,15 +298,21 @@ class CausalWanSelfAttention(nn.Module):
             #     print(f"kv_cache['local_end_index'] = {kv_cache['local_end_index']}")
             #     print(f"num_new_tokens = {num_new_tokens}")
 
+            # P1 优化: 一次性读取所有索引值，避免重复 .item() 调用
+            cache_global_end = kv_cache["global_end_index"].item()
+            cache_local_end = kv_cache["local_end_index"].item()
+            bank_global_end = kv_bank["global_end_index"].item()
+            bank_local_end = kv_bank["local_end_index"].item()
+
             # Compute cache update parameters without modifying kv_cache directly
             cache_update_info = None
-            is_recompute = current_end <= kv_cache["global_end_index"].item() and current_start > 0
-            if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
-                    num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
+            is_recompute = current_end <= cache_global_end and current_start > 0
+            if self.local_attn_size != -1 and (current_end > cache_global_end) and (
+                    num_new_tokens + cache_local_end > kv_cache_size):
                 # Calculate the number of new tokens added in this step
                 # Shift existing cache content left to discard oldest tokens
-                num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
-                num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
+                num_evicted_tokens = num_new_tokens + cache_local_end - kv_cache_size
+                num_rolled_tokens = cache_local_end - num_evicted_tokens - sink_tokens
                 # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
                 #     print(f"need roll")
                 #     print(f"num_rolled_tokens: {num_rolled_tokens / frame_seqlen}")
@@ -313,8 +320,7 @@ class CausalWanSelfAttention(nn.Module):
                 #     print(f"sink_tokens: {sink_tokens / frame_seqlen}")
 
                 # Compute updated local indices
-                local_end_index = kv_cache["local_end_index"].item() + current_end - \
-                    kv_cache["global_end_index"].item() - num_evicted_tokens
+                local_end_index = cache_local_end + current_end - cache_global_end - num_evicted_tokens
                 local_start_index = local_end_index - num_new_tokens
 
                 # Construct full k, v for attention computation (without modifying the original cache)
@@ -322,7 +328,7 @@ class CausalWanSelfAttention(nn.Module):
                 temp_k = kv_cache["k"].clone()
                 temp_v = kv_cache["v"].clone()
 
-                local_end_index_bank = kv_bank["local_end_index"].item() + current_end_bank - kv_bank["global_end_index"].item()
+                local_end_index_bank = bank_local_end + current_end_bank - bank_global_end
                 local_start_index_bank = local_end_index_bank - num_new_tokens//3
 
                 bank_k = kv_bank["k"].clone()
@@ -369,14 +375,14 @@ class CausalWanSelfAttention(nn.Module):
                 #     print(f"used kv cache size: local_end_index - local_start_index = {local_end_index - local_start_index}")
             else:
                 # Assign new keys/values directly up to current_end
-                local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
+                local_end_index = cache_local_end + current_end - cache_global_end
                 local_start_index = local_end_index - num_new_tokens
 
                 # Construct full k, v for attention computation (without modifying the original cache)
                 temp_k = kv_cache["k"].clone()
                 temp_v = kv_cache["v"].clone()
 
-                local_end_index_bank = kv_bank["local_end_index"].item() + current_end_bank - kv_bank["global_end_index"].item()
+                local_end_index_bank = bank_local_end + current_end_bank - bank_global_end
                 local_start_index_bank = local_end_index_bank - num_new_tokens//3
 
                 bank_k = kv_bank["k"].clone()
@@ -433,12 +439,9 @@ class CausalWanSelfAttention(nn.Module):
                     else:
                         local_end_index_bank_ = min(local_end_index_bank, kv_bank_size)
 
-                    # IAM: 直接使用 kv_bank["local_end_index"] 作为读取长度
-                    # 因为 IAM 的 _inject_iam_memory_to_bank 会直接设置这个值
-                    # 而不使用 MemFlow 的 current_end_bank 公式
-                    iam_bank_length = kv_bank["local_end_index"].item()
+                    # P0 优化: 使用传入的 iam_bank_length 参数，避免 .item() 调用
+                    # iam_bank_length 由 Pipeline 在 _inject_iam_memory_to_bank 时缓存
                     if iam_bank_length > 0:
-                        # IAM 模式: 使用 IAM 注入的长度
                         local_end_index_bank_ = min(iam_bank_length, kv_bank_size)
 
                     k_bank = bank_k[:, :local_end_index_bank_]
@@ -555,6 +558,7 @@ class CausalWanAttentionBlock(nn.Module):
         update_bank=None,
         q_bank=None,
         is_recache=None,
+        iam_bank_length=0,  # P0 优化
     ):
         r"""
         Args:
@@ -574,7 +578,8 @@ class CausalWanAttentionBlock(nn.Module):
         self_attn_result = self.self_attn(
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
-            freqs, block_mask, kv_cache, current_start, cache_start, kv_bank, update_bank, is_recache)
+            freqs, block_mask, kv_cache, current_start, cache_start, kv_bank, update_bank, is_recache,
+            iam_bank_length=iam_bank_length)  # P0 优化
         
         if kv_cache is not None:
             y, cache_update_info = self_attn_result
@@ -1021,9 +1026,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         cache["k"][:, write_start_index:write_end_index] = new_k
                         cache["v"][:, write_start_index:write_end_index] = new_v
                         if update_bank:
-                            bank["k_new"] = new_k[:, :1560]
-                            bank["v_new"] = new_v[:, :1560]
-                    
+                            bank["k_new"][:,:] = new_k[:, :1560]
+                            bank["v_new"][:,:] = new_v[:, :1560]
+
                 elif update_info["action"] == "direct_insert":
                     # Direct insert
                     local_start_index = update_info["local_start_index"]
@@ -1043,9 +1048,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         cache["k"][:, write_start_index:write_end_index] = new_k
                         cache["v"][:, write_start_index:write_end_index] = new_v
                         if update_bank:
-                            bank["k_new"] = new_k[:, :1560]
-                            bank["v_new"] = new_v[:, :1560]
-            
+                            bank["k_new"][:,:] = new_k[:, :1560]
+                            bank["v_new"][:,:] = new_v[:, :1560]
+
             # Update indices: do not roll back pointers during recomputation
             is_recompute = False if update_info is None else update_info.get("is_recompute", False)
             if not is_recompute:
@@ -1076,6 +1081,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         q_bank: bool = False,
         update_cache: bool = True,
         is_recache: bool = False,
+        iam_bank_length: int = 0,  # P0 优化: 避免在 forward 中调用 .item()
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -1161,7 +1167,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             context_lens=context_lens,
             block_mask=self.block_mask,
             is_recache=is_recache,
-            update_bank=update_bank
+            update_bank=update_bank,
+            iam_bank_length=iam_bank_length,  # P0 优化
         )
         # print("kwargs done")
         def create_custom_forward(module):

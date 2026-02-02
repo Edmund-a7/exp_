@@ -245,6 +245,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         q_bank: Optional[bool] = False,
         update_cache: Optional[bool] = False,
         is_recache: Optional[bool] = False,
+        iam_bank_length: Optional[int] = 0,  # P0 优化: 避免在 forward 中调用 .item()
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
@@ -270,6 +271,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 q_bank=q_bank,
                 update_cache=update_cache,
                 is_recache=is_recache,
+                iam_bank_length=iam_bank_length,  # P0 优化
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:

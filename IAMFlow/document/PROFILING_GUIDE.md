@@ -37,9 +37,10 @@ IAM Agent Pipeline Profiling Results
   - Throughput:                  5.07 FPS
 
 [IAM Components (within diffusion)]
+  - Total Recache time:       345.67 ms ( 1.84% of diffusion)
   - Total LLM Agent time:      456.78 ms ( 2.43% of diffusion)
   - Total Memory Bank time:    234.56 ms ( 1.25% of diffusion)
-  - Pure diffusion time:     18074.09 ms (96.32% of diffusion)
+  - Pure diffusion time:     17728.42 ms (94.48% of diffusion)
 
 [LLM Agent - Per Prompt]
   - Prompt 1       processing:   234.56 ms
@@ -90,9 +91,10 @@ IAM Agent Pipeline Profiling Results
 ### IAM 组件（在扩散时间内）
 | 指标 | 说明 |
 |------|------|
+| **Total Recache time** | prompt 切换时的 cache 重置耗时 |
 | **Total LLM Agent time** | 所有 prompt 的 LLM Agent 处理总时间 |
 | **Total Memory Bank time** | 所有 chunk 的 Memory Bank 选帧总时间 |
-| **Pure diffusion time** | 纯粹的扩散生成时间（排除 IAM 组件） |
+| **Pure diffusion time** | 纯粹的扩散生成时间（排除 IAM 组件与 recache） |
 
 ### 详细分解
 | 类别 | 说明 |

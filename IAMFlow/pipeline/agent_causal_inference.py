@@ -25,6 +25,7 @@ from pipeline.interactive_causal_inference import InteractiveCausalInferencePipe
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from utils.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation
 from utils.debug_option import DEBUG
+from utils.profiling import compute_pure_diffusion_time
 
 # IAM 模块
 from iam.llm_agent import LLMAgent, EntityStruct
@@ -91,6 +92,9 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         self.current_entities: List[EntityStruct] = []
         self.current_prompt_text: str = ""  # 当前 prompt 文本，用于精确定位实体位置
 
+        # P0 优化: 缓存 IAM bank 长度，避免在 forward 中调用 .item()
+        self._iam_bank_length = 0
+
         # 配置
         self.llm_model_path = llm_model_path
         self.max_memory_frames = max_memory_frames
@@ -149,6 +153,8 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             vae_end = torch.cuda.Event(enable_timing=True)
             block_start = torch.cuda.Event(enable_timing=True)
             block_end = torch.cuda.Event(enable_timing=True)
+            recache_start = torch.cuda.Event(enable_timing=True)
+            recache_end = torch.cuda.Event(enable_timing=True)
 
             # IAM specific timers
             agent_start = torch.cuda.Event(enable_timing=True)
@@ -159,6 +165,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             block_times = []
             agent_times = []  # Per-prompt agent processing time
             memory_times = []  # Per-chunk memory bank time
+            recache_times = []
 
             init_start.record()
 
@@ -256,7 +263,16 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
 
                 # ===== 2. Recache (必须在 LLM Agent 处理之前) =====
                 # 重置 kv_cache 和 crossattn_cache
+                if profile:
+                    recache_start.record()
+
                 self._recache_after_switch(output, current_start_frame, cond_list[segment_idx])
+
+                if profile:
+                    recache_end.record()
+                    torch.cuda.synchronize()
+                    recache_time = recache_start.elapsed_time(recache_end)
+                    recache_times.append((f"Prompt {segment_idx + 1}", recache_time))
 
                 # ===== 3. LLM Agent 处理新 prompt =====
                 if profile:
@@ -312,6 +328,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
                         current_start=current_start_frame * self.frame_seq_length,
                         update_bank=False,  # 关键: 始终 False
                         q_bank=q_bank,
+                        iam_bank_length=self._iam_bank_length,  # P0 优化
                     )
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
@@ -333,6 +350,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
                         current_start=current_start_frame * self.frame_seq_length,
                         update_bank=False,  # 关键: 始终 False
                         q_bank=q_bank,
+                        iam_bank_length=self._iam_bank_length,  # P0 优化
                     )
 
             # 记录输出
@@ -371,6 +389,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
                 update_bank=False,  # 关键: 始终 False，IAM 自己管理
                 q_bank=q_bank,
                 update_cache=True,
+                iam_bank_length=self._iam_bank_length,  # P0 优化
             )
 
             if profile:
@@ -411,6 +430,13 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             total_time = init_time + diffusion_time + vae_time
             total_agent_time = sum(t for _, t in agent_times)
             total_memory_time = sum(t for _, t in memory_times)
+            total_recache_time = sum(t for _, t in recache_times)
+            pure_time, pure_pct = compute_pure_diffusion_time(
+                diffusion_time=diffusion_time,
+                agent_time=total_agent_time,
+                memory_time=total_memory_time,
+                recache_time=total_recache_time,
+            )
 
             print("\n" + "=" * 70)
             print("IAM Agent Pipeline Profiling Results")
@@ -426,9 +452,16 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
 
             # IAM-specific breakdown
             print(f"\n[IAM Components (within diffusion)]")
+            print(f"  - Total Recache time:      {total_recache_time:8.2f} ms ({100 * total_recache_time / diffusion_time:5.2f}% of diffusion)")
             print(f"  - Total LLM Agent time:    {total_agent_time:8.2f} ms ({100 * total_agent_time / diffusion_time:5.2f}% of diffusion)")
             print(f"  - Total Memory Bank time:  {total_memory_time:8.2f} ms ({100 * total_memory_time / diffusion_time:5.2f}% of diffusion)")
-            print(f"  - Pure diffusion time:     {diffusion_time - total_agent_time - total_memory_time:8.2f} ms ({100 * (diffusion_time - total_agent_time - total_memory_time) / diffusion_time:5.2f}% of diffusion)")
+            print(f"  - Pure diffusion time:     {pure_time:8.2f} ms ({pure_pct:5.2f}% of diffusion)")
+
+            # Per-prompt recache time
+            if recache_times:
+                print(f"\n[Recache - Per Prompt Switch]")
+                for prompt_name, time_ms in recache_times:
+                    print(f"  - {prompt_name:12s} recache:    {time_ms:8.2f} ms")
 
             # Per-prompt agent time
             if agent_times:
@@ -495,6 +528,8 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
                 blk["local_end_index"].zero_()
                 blk["global_end_index"].zero_()
                 # 注意: 不需要 zero_() k/v 内容，因为 _inject_iam_memory_to_bank 会覆盖
+            # P0 优化: 同步重置缓存的 bank 长度
+            self._iam_bank_length = 0
             if DEBUG:
                 print(f"[AgentPipeline] Reset kv_bank indices for prompt switch")
 
@@ -505,6 +540,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         self.current_entities = []
         self.current_prompt_text = ""
         self.agent_memory_bank.clear()
+        self._iam_bank_length = 0
         # 重置 LLM Agent 的 ID 计数器，确保每次推理 global_registry 从 1 开始
         # 注意: LLMAgent 内部使用 id_manager (GlobalIDManager 实例) 来管理 ID
         self.llm_agent.id_manager._next_id = 1
@@ -713,6 +749,10 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             # 更新索引
             bank["local_end_index"].fill_(write_length)
             bank["global_end_index"].fill_(write_length)
+
+        # P0 优化: 缓存 bank 长度，避免在 forward 中调用 .item()
+        # write_length 对所有 block 相同，使用最后一次的值
+        self._iam_bank_length = write_length
 
         print(f"[DEBUG] Injected {memory_length} tokens to all {len(self.kv_bank1)} blocks")
 
