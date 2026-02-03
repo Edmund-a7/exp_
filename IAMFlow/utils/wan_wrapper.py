@@ -132,13 +132,30 @@ class WanDiffusionWrapper(torch.nn.Module):
             bank_size=3,
             record_interval=3,
             SMA=False,
-            sparse_top_k=6
+            sparse_top_k=6,
+            tcat_enabled=False,
+            tcat_sink_k=1,
+            tcat_mem_k=2,
+            tcat_local_k=6,
+            tcat_ema_alpha=0.3,
     ):
         super().__init__()
 
         if is_causal:
             self.model = CausalWanModel.from_pretrained(
-                f"{WAN_MODEL_PATH}/", local_attn_size=local_attn_size, sink_size=sink_size, bank_size=bank_size, record_interval=record_interval, SMA=SMA, sparse_top_k=sparse_top_k)
+                f"{WAN_MODEL_PATH}/",
+                local_attn_size=local_attn_size,
+                sink_size=sink_size,
+                bank_size=bank_size,
+                record_interval=record_interval,
+                SMA=SMA,
+                sparse_top_k=sparse_top_k,
+                tcat_enabled=tcat_enabled,
+                tcat_sink_k=tcat_sink_k,
+                tcat_mem_k=tcat_mem_k,
+                tcat_local_k=tcat_local_k,
+                tcat_ema_alpha=tcat_ema_alpha,
+            )
         else:
             self.model = WanModel.from_pretrained(f"{WAN_MODEL_PATH}/")
         self.model.eval()

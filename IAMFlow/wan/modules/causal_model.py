@@ -78,7 +78,8 @@ class CausalWanSelfAttention(nn.Module):
                  tcat_enabled=False,
                  tcat_sink_k=1,
                  tcat_mem_k=2,
-                 tcat_local_k=3):
+                 tcat_local_k=6,
+                 tcat_ema_alpha=0.3):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -96,6 +97,11 @@ class CausalWanSelfAttention(nn.Module):
         self.tcat_sink_k = tcat_sink_k
         self.tcat_mem_k = tcat_mem_k
         self.tcat_local_k = tcat_local_k
+        self.tcat_ema_alpha = tcat_ema_alpha
+        # TCAT EMA state (per region)
+        self.tcat_prev_scores_sink = None
+        self.tcat_prev_scores_mem = None
+        self.tcat_prev_scores_local = None
 
         # Support list/tuple local_attn_size by converting to list first (handles OmegaConf ListConfig)
         if not isinstance(local_attn_size, int) and hasattr(local_attn_size, "__iter__"):
@@ -172,6 +178,12 @@ class CausalWanSelfAttention(nn.Module):
 
         return final_k, final_v
 
+    def reset_tcat_ema(self):
+        """Reset TCAT EMA state. Call this when starting a new video."""
+        self.tcat_prev_scores_sink = None
+        self.tcat_prev_scores_mem = None
+        self.tcat_prev_scores_local = None
+
     # TCAT: Temporal Coverage Aware Top-k Sparse Attention
     def tcat_routing_attention(
         self,
@@ -187,6 +199,8 @@ class CausalWanSelfAttention(nn.Module):
         """
         TCAT: Per-region top-k selection with temporal coverage guarantee.
 
+        Uses global shared top-k selection across heads for better consistency.
+
         Args:
             query: [B, L_q, H, D]
             k_sink, v_sink: Sink region K/V [B, L_sink, H, D]
@@ -199,75 +213,108 @@ class CausalWanSelfAttention(nn.Module):
         """
         B, L_q, H, D = query.shape
 
-        # Compute query descriptor
-        phi_q = query.mean(dim=1, keepdim=True).permute(0, 2, 1, 3)  # [B, H, 1, D]
-
-        selected_k_list = []
-        selected_v_list = []
-
-        # Process each region with its own top-k
         regions = [
             (k_sink, v_sink, self.tcat_sink_k),
             (k_mem, v_mem, self.tcat_mem_k),
             (k_local, v_local, self.tcat_local_k),
         ]
 
-        for k_region, v_region, top_k in regions:
-            L_region = k_region.shape[1]
-            if L_region == 0:
-                continue
+        # Fallback: any remainder or too few chunks -> keep all
+        lengths = [k.shape[1] for k, _, _ in regions]
+        if any(L > 0 and (L % chunk_size != 0) for L in lengths):
+            return torch.cat([k_sink, k_mem, k_local], dim=1), torch.cat([v_sink, v_mem, v_local], dim=1)
 
-            num_chunks = L_region // chunk_size
+        num_chunks_list = [L // chunk_size for L in lengths]
+        total_chunks = sum(num_chunks_list)
+        total_k = self.tcat_sink_k + self.tcat_mem_k + self.tcat_local_k
+
+        if total_chunks == 0 or total_chunks <= total_k:
+            return torch.cat([k_sink, k_mem, k_local], dim=1), torch.cat([v_sink, v_mem, v_local], dim=1)
+
+        # Compute query descriptor
+        phi_q = query.mean(dim=1, keepdim=True).permute(0, 2, 1, 3)  # [B, H, 1, D]
+
+        scores_all_list = []
+        k_chunks_all_list = []
+        v_chunks_all_list = []
+        base_idx_list = []
+        base_total = 0
+        offset = 0
+
+        for (k_region, v_region, top_k), num_chunks in zip(regions, num_chunks_list):
             if num_chunks == 0:
-                # Region smaller than chunk_size, keep all
-                selected_k_list.append(k_region)
-                selected_v_list.append(v_region)
+                offset += num_chunks
                 continue
 
-            # Handle case where region has fewer chunks than top_k
-            k_select = min(top_k, num_chunks)
-
-            if k_select >= num_chunks:
-                # Keep all chunks in this region
-                selected_k_list.append(k_region)
-                selected_v_list.append(v_region)
-                continue
-
-            # Chunk the region
             k_chunks = k_region.view(B, num_chunks, chunk_size, H, D)
             v_chunks = v_region.view(B, num_chunks, chunk_size, H, D)
 
             # Compute chunk descriptors
             phi_k = k_chunks.mean(dim=2).permute(0, 2, 1, 3)  # [B, H, num_chunks, D]
 
-            # Compute relevance scores
+            # Compute relevance scores (global shared top-k across heads)
             scores = torch.matmul(phi_q, phi_k.transpose(-2, -1)).squeeze(2)  # [B, H, num_chunks]
+            scores = scores.mean(dim=1)  # [B, num_chunks]
 
-            # Select top-k indices
-            _, top_k_idx = torch.topk(scores, k=k_select, dim=-1)  # [B, H, k_select]
-            top_k_idx_sorted, _ = torch.sort(top_k_idx, dim=-1)  # Preserve temporal order
+            scores_all_list.append(scores)
+            k_chunks_all_list.append(k_chunks)
+            v_chunks_all_list.append(v_chunks)
 
-            # Gather selected chunks
-            k_chunks_p = k_chunks.permute(0, 3, 1, 2, 4)  # [B, H, num_chunks, chunk_size, D]
-            v_chunks_p = v_chunks.permute(0, 3, 1, 2, 4)
+            k_select = min(top_k, num_chunks)
+            base_total += k_select
+            if k_select > 0:
+                _, top_k_idx = torch.topk(scores, k=k_select, dim=-1)  # [B, k_select]
+                base_idx_list.append(top_k_idx + offset)
 
-            expanded_idx = top_k_idx_sorted.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, chunk_size, D)
-            sel_k = torch.gather(k_chunks_p, 2, expanded_idx)  # [B, H, k_select, chunk_size, D]
-            sel_v = torch.gather(v_chunks_p, 2, expanded_idx)
+            offset += num_chunks
 
-            # Reshape back to [B, L, H, D]
-            L_sel = k_select * chunk_size
-            sel_k = sel_k.reshape(B, H, L_sel, D).permute(0, 2, 1, 3)
-            sel_v = sel_v.reshape(B, H, L_sel, D).permute(0, 2, 1, 3)
+        if not scores_all_list:
+            return torch.cat([k_sink, k_mem, k_local], dim=1), torch.cat([v_sink, v_mem, v_local], dim=1)
 
-            selected_k_list.append(sel_k)
-            selected_v_list.append(sel_v)
+        scores_all = torch.cat(scores_all_list, dim=1)  # [B, total_chunks]
+        base_idx = torch.cat(base_idx_list, dim=1) if base_idx_list else None
 
-        # Concatenate all selected regions (already in temporal order)
-        final_k = torch.cat(selected_k_list, dim=1)
-        final_v = torch.cat(selected_v_list, dim=1)
+        # Allocate leftover quota to highest-scoring chunks across all regions
+        leftover = total_k - base_total
+        remaining = total_chunks - base_total
+        if leftover > 0 and remaining > 0:
+            leftover = min(leftover, remaining)
+            scores_masked = scores_all.clone()
+            if base_idx is not None and base_idx.numel() > 0:
+                scores_masked = scores_masked.scatter(1, base_idx, float("-inf"))
+            _, extra_idx = torch.topk(scores_masked, k=leftover, dim=-1)
+            if base_idx is not None and base_idx.numel() > 0:
+                final_idx = torch.cat([base_idx, extra_idx], dim=-1)
+            else:
+                final_idx = extra_idx
+        else:
+            final_idx = base_idx
 
-        return final_k, final_v
+        if final_idx is None or final_idx.numel() == 0:
+            return torch.cat([k_sink, k_mem, k_local], dim=1), torch.cat([v_sink, v_mem, v_local], dim=1)
+
+        final_idx_sorted, _ = torch.sort(final_idx, dim=-1)
+
+        # Log selected tokens for debugging
+        if DEBUG:
+            print(f"[TCAT] Selected {final_idx_sorted.shape[1]} chunks: {final_idx_sorted[0].tolist()}")
+
+        k_chunks_all = torch.cat(k_chunks_all_list, dim=1)  # [B, total_chunks, chunk_size, H, D]
+        v_chunks_all = torch.cat(v_chunks_all_list, dim=1)
+
+        k_chunks_p = k_chunks_all.permute(0, 3, 1, 2, 4)  # [B, H, total_chunks, chunk_size, D]
+        v_chunks_p = v_chunks_all.permute(0, 3, 1, 2, 4)
+
+        expanded_idx = final_idx_sorted.unsqueeze(1).expand(-1, H, -1)
+        expanded_idx = expanded_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, chunk_size, D)
+        sel_k = torch.gather(k_chunks_p, 2, expanded_idx)  # [B, H, k_total, chunk_size, D]
+        sel_v = torch.gather(v_chunks_p, 2, expanded_idx)
+
+        L_sel = final_idx_sorted.shape[1] * chunk_size
+        sel_k = sel_k.reshape(B, H, L_sel, D).permute(0, 2, 1, 3)
+        sel_v = sel_v.reshape(B, H, L_sel, D).permute(0, 2, 1, 3)
+
+        return sel_k, sel_v
 
     def forward(
         self,
@@ -635,7 +682,8 @@ class CausalWanAttentionBlock(nn.Module):
                  tcat_enabled=False,
                  tcat_sink_k=1,
                  tcat_mem_k=2,
-                 tcat_local_k=3):
+                 tcat_local_k=6,
+                 tcat_ema_alpha=0.3):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -650,7 +698,7 @@ class CausalWanAttentionBlock(nn.Module):
         self.self_attn = CausalWanSelfAttention(
             dim, num_heads, local_attn_size, sink_size, qk_norm, eps,
             record_interval, SMA, sparse_top_k,
-            tcat_enabled, tcat_sink_k, tcat_mem_k, tcat_local_k
+            tcat_enabled, tcat_sink_k, tcat_mem_k, tcat_local_k, tcat_ema_alpha
         )
         self.norm3 = WanLayerNorm(
             dim, eps,
@@ -805,7 +853,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  tcat_enabled=False,
                  tcat_sink_k=1,
                  tcat_mem_k=2,
-                 tcat_local_k=3,
+                 tcat_local_k=6,
+                 tcat_ema_alpha=0.3,
                  qk_norm=True,
                  cross_attn_norm=True,
                  eps=1e-6):
@@ -887,7 +936,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 cross_attn_type, dim, ffn_dim, num_heads,
                 local_attn_size, sink_size, bank_size, qk_norm, cross_attn_norm, eps,
                 record_interval, SMA, sparse_top_k,
-                tcat_enabled, tcat_sink_k, tcat_mem_k, tcat_local_k
+                tcat_enabled, tcat_sink_k, tcat_mem_k, tcat_local_k, tcat_ema_alpha
             )
             for _ in range(num_layers)
         ])
