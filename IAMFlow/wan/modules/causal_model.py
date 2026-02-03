@@ -1441,6 +1441,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 kwargs.update(
                     {
                         "kv_cache": kv_cache[block_index],
+                        "crossattn_cache": crossattn_cache[block_index],
+                        "prev_crossattn_cache": prev_crossattn_cache[block_index] if prev_crossattn_cache else None,
                         "current_start": current_start,
                         "cache_start": cache_start,
                         "kv_bank": kv_bank[block_index],
