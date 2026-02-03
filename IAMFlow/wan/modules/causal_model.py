@@ -594,6 +594,9 @@ class CausalWanSelfAttention(nn.Module):
                             v_local=v_local,
                             chunk_size=1560,
                         )
+                        if not hasattr(self, "_tcat_logged"):
+                            print(f"[TCAT] k_cat tokens: {k_cat.shape[1]}")
+                            self._tcat_logged = True
                     # SMA: 稀疏注意力 (与 MemFlow 保持一致)
                     elif self.SMA:
                         # Sink + Bank 稀疏化，Local 保留全部
