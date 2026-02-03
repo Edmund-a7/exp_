@@ -113,11 +113,19 @@ def main():
     save_frames_to_disk = args.save_frames_to_disk or getattr(config, "save_frames_to_disk", False)
     use_vllm = getattr(config, "use_vllm", True)  # 默认使用 vLLM
 
+    # LLM optimization parameters
+    llm_dtype = getattr(config, "llm_dtype", "auto")
+    llm_gpu_memory_utilization = getattr(config, "llm_gpu_memory_utilization", 0.3)
+    llm_max_model_len = getattr(config, "llm_max_model_len", 2048)
+
     if local_rank == 0:
         print("=" * 60)
         print("IAM Agent Causal Inference Pipeline")
         print("=" * 60)
         print(f"LLM Model Path: {llm_model_path}")
+        print(f"LLM dtype: {llm_dtype}")
+        print(f"LLM GPU Memory Utilization: {llm_gpu_memory_utilization}")
+        print(f"LLM Max Model Length: {llm_max_model_len}")
         print(f"Max Memory Frames: {max_memory_frames}")
         print(f"Save Directory: {save_dir}")
         print(f"Save Frames to Disk: {save_frames_to_disk}")
@@ -131,7 +139,10 @@ def main():
         max_memory_frames=max_memory_frames,
         save_dir=save_dir,
         save_frames_to_disk=save_frames_to_disk,
-        use_vllm=use_vllm
+        use_vllm=use_vllm,
+        llm_dtype=llm_dtype,
+        llm_gpu_memory_utilization=llm_gpu_memory_utilization,
+        llm_max_model_len=llm_max_model_len,
     )
 
     # ----------------------------- Load base checkpoint -----------------------------
