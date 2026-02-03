@@ -158,13 +158,16 @@ class WanSelfAttention(nn.Module):
 
 class WanT2VCrossAttention(WanSelfAttention):
 
-    def forward(self, x, context, context_lens, crossattn_cache=None):
+    def forward(self, x, context, context_lens, crossattn_cache=None,
+                prev_crossattn_cache=None, transition_alpha=None):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
             crossattn_cache (List[dict], *optional*): Contains the cached key and value tensors for context embedding.
+            prev_crossattn_cache (dict, *optional*): SPT - Previous prompt's cached K,V for soft transition.
+            transition_alpha (float, *optional*): SPT - Blend coefficient, 0=old prompt, 1=new prompt.
         """
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
@@ -184,6 +187,13 @@ class WanT2VCrossAttention(WanSelfAttention):
         else:
             k = self.norm_k(self.k(context)).view(b, -1, n, d)
             v = self.v(context).view(b, -1, n, d)
+
+        # SPT: Blend with previous prompt's K,V during transition
+        if transition_alpha is not None and prev_crossattn_cache is not None:
+            k_old = prev_crossattn_cache["k"]
+            v_old = prev_crossattn_cache["v"]
+            k = (1 - transition_alpha) * k_old + transition_alpha * k
+            v = (1 - transition_alpha) * v_old + transition_alpha * v
 
         # compute attention
         x = flash_attention(q, k, v, k_lens=context_lens)

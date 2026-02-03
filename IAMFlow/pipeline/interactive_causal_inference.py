@@ -12,6 +12,7 @@ import torch
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from utils.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation
+from utils.transition_scheduler import create_scheduler, TransitionScheduler
 from pipeline.causal_inference import CausalInferencePipeline
 import torch.distributed as dist
 from utils.debug_option import DEBUG
@@ -29,6 +30,26 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
     ):
         super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae)
         self.global_sink = getattr(args, "global_sink", False)
+
+        # SPT (Soft Prompt Transition) state
+        self.spt_enabled = getattr(args, "spt_enabled", False)
+        self.prev_crossattn_cache = None
+        self.frames_since_switch = None
+        self.transition_scheduler: Optional[TransitionScheduler] = None
+
+        if self.spt_enabled:
+            spt_config = getattr(args, "spt", None)
+            if spt_config:
+                self.transition_scheduler = create_scheduler(
+                    scheduler_type=getattr(spt_config, "scheduler_type", "cosine"),
+                    window_frames=getattr(spt_config, "window_frames", 9),
+                    delay_frames=getattr(spt_config, "delay_frames", 3),
+                    steepness=getattr(spt_config, "steepness", 6.0),
+                    frames_per_chunk=getattr(spt_config, "frames_per_chunk", 3),
+                )
+            else:
+                self.transition_scheduler = create_scheduler()
+            print(f"[SPT] Enabled with {type(self.transition_scheduler).__name__}")
 
     # Internal helpers
     def _recache_after_switch(self, output, current_start_frame, new_conditional_dict):
@@ -98,6 +119,43 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             blk["k"].zero_()
             blk["v"].zero_()
             blk["is_init"] = False
+
+    def _soft_switch(self):
+        """
+        SPT: 软切换 - 保存旧 prompt 的 K,V，准备渐变过渡
+        不执行 recache，而是在后续帧中逐渐混合新旧 prompt
+        """
+        # 保存旧 prompt 的 cross-attention K,V
+        self.prev_crossattn_cache = [
+            {"k": blk["k"].clone(), "v": blk["v"].clone()}
+            for blk in self.crossattn_cache
+        ]
+        self.frames_since_switch = 0
+
+        # 重置 crossattn_cache，让新 prompt 的 K,V 在下次 forward 时计算
+        for blk in self.crossattn_cache:
+            blk["is_init"] = False
+
+        print(f"[SPT] Soft switch initiated, transition window: {self.transition_scheduler.total_frames} frames")
+
+    def _get_current_transition_alpha(self) -> Optional[float]:
+        """获取当前帧的过渡系数 α"""
+        if self.frames_since_switch is None:
+            return None
+        return self.transition_scheduler.get_alpha(self.frames_since_switch)
+
+    def _update_transition_state(self, num_frames: int):
+        """更新过渡状态，检查是否完成"""
+        if self.frames_since_switch is None:
+            return
+
+        self.frames_since_switch += num_frames
+
+        if self.transition_scheduler.is_complete(self.frames_since_switch):
+            # 过渡完成，释放旧 cache
+            self.prev_crossattn_cache = None
+            self.frames_since_switch = None
+            print("[SPT] Transition complete, released prev_crossattn_cache")
 
     def inference(
         self,
@@ -201,7 +259,11 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             
             if next_switch_pos is not None and current_start_frame >= next_switch_pos:
                 segment_idx += 1
-                self._recache_after_switch(output, current_start_frame, cond_list[segment_idx])
+                # SPT: 使用软切换或传统 recache
+                if self.spt_enabled:
+                    self._soft_switch()
+                else:
+                    self._recache_after_switch(output, current_start_frame, cond_list[segment_idx])
                 if DEBUG:
                     print(
                         f"[MultipleSwitch] Switch to segment {segment_idx} at frame {current_start_frame}"
@@ -214,6 +276,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 print(f"segment_idx: {segment_idx}")
                 print(f"text_prompts_list[segment_idx]: {text_prompts_list[segment_idx]}")
             cond_in_use = cond_list[segment_idx]
+
+            # SPT: 获取当前过渡系数
+            transition_alpha = self._get_current_transition_alpha() if self.spt_enabled else None
 
             noisy_input = noise[
                 :, current_start_frame : current_start_frame + current_num_frames
@@ -244,6 +309,8 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                         current_start=current_start_frame * self.frame_seq_length,
                         update_bank=False,
                         q_bank=q_bank,
+                        prev_crossattn_cache=self.prev_crossattn_cache,
+                        transition_alpha=transition_alpha,
                     )
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
@@ -265,6 +332,8 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                         current_start=current_start_frame * self.frame_seq_length,
                         update_bank=False,
                         q_bank=q_bank,
+                        prev_crossattn_cache=self.prev_crossattn_cache,
+                        transition_alpha=transition_alpha,
                     )
 
             # Record output
@@ -283,7 +352,13 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 update_bank=update_bank,
                 q_bank=q_bank,
                 update_cache=True,
+                prev_crossattn_cache=self.prev_crossattn_cache,
+                transition_alpha=transition_alpha,
             )
+
+            # SPT: 更新过渡状态
+            if self.spt_enabled:
+                self._update_transition_state(current_num_frames)
 
             # Update frame pointer
             current_start_frame += current_num_frames

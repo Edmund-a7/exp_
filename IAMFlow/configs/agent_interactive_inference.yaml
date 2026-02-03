@@ -38,6 +38,15 @@ switch_frame_indices: 40, 80, 120, 160, 200
 global_sink: true
 context_noise: 0
 
+# SPT: Soft Prompt Transition
+spt_enabled: false  # Set to true to enable soft transition (disables recache)
+spt:
+  scheduler_type: cosine  # linear, cosine, sigmoid, step
+  window_frames: 9        # Transition window (3 chunks)
+  delay_frames: 3         # Delay before blending starts (1 chunk)
+  steepness: 6.0          # Sigmoid scheduler only
+  frames_per_chunk: 3     # Step scheduler only
+
 # Checkpoints
 generator_ckpt: checkpoints/base.pt
 lora_ckpt: checkpoints/lora.pt

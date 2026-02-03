@@ -790,7 +790,10 @@ class CausalWanAttentionBlock(nn.Module):
         update_bank=None,
         q_bank=None,
         is_recache=None,
-        iam_bank_length=0,  # P0 优化
+        iam_bank_length=0,
+        # SPT parameters
+        prev_crossattn_cache=None,
+        transition_alpha=None,
     ):
         r"""
         Args:
@@ -823,9 +826,12 @@ class CausalWanAttentionBlock(nn.Module):
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
 
         # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None):
+        def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None,
+                          prev_crossattn_cache=None, transition_alpha=None):
             x = x + self.cross_attn(self.norm3(x), context,
-                                    context_lens, crossattn_cache=crossattn_cache)
+                                    context_lens, crossattn_cache=crossattn_cache,
+                                    prev_crossattn_cache=prev_crossattn_cache,
+                                    transition_alpha=transition_alpha)
             y = self.ffn(
                 (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
                  frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
@@ -835,7 +841,8 @@ class CausalWanAttentionBlock(nn.Module):
                      frame_seqlen)) * e[5]).flatten(1, 2)
             return x
 
-        x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache)
+        x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache,
+                          prev_crossattn_cache, transition_alpha)
         
         if cache_update_info is not None:
             # cache_update_info is already in the format (current_end, local_end_index, cache_update_info)
@@ -1324,7 +1331,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         q_bank: bool = False,
         update_cache: bool = True,
         is_recache: bool = False,
-        iam_bank_length: int = 0,  # P0 优化: 避免在 forward 中调用 .item()
+        iam_bank_length: int = 0,
+        # SPT (Soft Prompt Transition) parameters
+        prev_crossattn_cache: dict = None,
+        transition_alpha: float = None,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -1411,7 +1421,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             block_mask=self.block_mask,
             is_recache=is_recache,
             update_bank=update_bank,
-            iam_bank_length=iam_bank_length,  # P0 优化
+            iam_bank_length=iam_bank_length,
+            transition_alpha=transition_alpha,
         )
         # print("kwargs done")
         def create_custom_forward(module):
@@ -1454,6 +1465,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     {
                         "kv_cache": kv_cache[block_index],
                         "crossattn_cache": crossattn_cache[block_index],
+                        "prev_crossattn_cache": prev_crossattn_cache[block_index] if prev_crossattn_cache else None,
                         "current_start": current_start,
                         "cache_start": cache_start,
                         "kv_bank": kv_bank[block_index],
