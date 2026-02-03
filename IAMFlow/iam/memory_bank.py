@@ -12,6 +12,7 @@ IAM_2 Memory Bank 模块
 
 import os
 import json
+import re
 from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass, field
 import torch
@@ -636,9 +637,11 @@ class MemoryBank:
         if not self.frame_active_memory:
             return None
 
+        frame_ids = sorted(self.frame_active_memory, key=self._frame_sort_key)
+
         # 收集所有帧的 KV
         all_frames_kv = []
-        for frame_id in self.frame_active_memory:
+        for frame_id in frame_ids:
             kv = self._load_frame_kv(frame_id)
             if kv is not None:
                 all_frames_kv.append(kv)
@@ -669,6 +672,13 @@ class MemoryBank:
             })
 
         return result
+
+    @staticmethod
+    def _frame_sort_key(frame_id: str) -> Tuple[int, int, int, str]:
+        match = re.match(r"p(\\d+)_c(\\d+)_f(\\d+)", frame_id)
+        if not match:
+            return (1 << 30, 1 << 30, 1 << 30, frame_id)
+        return (int(match.group(1)), int(match.group(2)), int(match.group(3)), frame_id)
 
     def get_active_frame_count(self) -> int:
         """获取当前active memory中的帧数"""
