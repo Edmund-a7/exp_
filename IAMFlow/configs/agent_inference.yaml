@@ -21,7 +21,8 @@ model_kwargs:
   tcat_enabled: True
   tcat_sink_k: 1   # Select top-1 from Sink region (3 chunks)
   tcat_mem_k: 2    # Select top-2 from Mem region (3 chunks)
-  tcat_local_k: 3  # Select top-3 from Local region (9 chunks)
+  tcat_local_k: 6  # Select top-6 from Local region (9 chunks)
+  tcat_ema_alpha: 0.3  # EMA smoothing factor (0=disabled)
 
 # Inference
 data_path: prompts/vidprom_filtered_extended.txt
@@ -49,6 +50,9 @@ adapter:
   verbose: false
 
 # IAM Agent Settings (optional for single prompt, but available)
-llm_model_path: ../Qwen3-0.6B
+llm_model_path: ../Qwen3-4B-FP8
+llm_dtype: auto              # "auto" 自动检测 FP8 预量化模型
+llm_gpu_memory_utilization: 0.3  # 限制显存，给 diffusion 模型留空间
+llm_max_model_len: 2048      # 实体提取任务不需要太长上下文
 max_memory_frames: 3
 save_dir: data/agent_frames
