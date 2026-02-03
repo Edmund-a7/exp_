@@ -123,7 +123,6 @@ class LLMWrapper:
                 dtype=self._dtype,
                 gpu_memory_utilization=self._gpu_memory_utilization,
                 max_model_len=self._max_model_len,
-                enforce_eager=False,  # 启用 CUDA Graph 加速推理
             )
             self._tokenizer = self._model.get_tokenizer()
             self._sampling_params = SamplingParams
