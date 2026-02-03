@@ -31,3 +31,4 @@ benchmark_results/
 MemFlow/prompts/vidprom_filtered_extended_switch.txt
 MemFlow/prompts/vidprom_filtered_extended.txt
 MemFlow/prompts/vidprom_filtered_extended*.txt
+.worktrees/

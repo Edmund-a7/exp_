@@ -277,7 +277,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 print(f"text_prompts_list[segment_idx]: {text_prompts_list[segment_idx]}")
             cond_in_use = cond_list[segment_idx]
 
-            # SPT: 获取当前过渡系数
+            # SPT: 获取当前过渡系数（按 chunk 采样，alpha 在一个 chunk 内保持不变）
             transition_alpha = self._get_current_transition_alpha() if self.spt_enabled else None
 
             noisy_input = noise[

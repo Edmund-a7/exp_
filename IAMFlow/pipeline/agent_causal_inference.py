@@ -261,12 +261,23 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             if next_switch_pos is not None and current_start_frame >= next_switch_pos:
                 segment_idx += 1
 
-                # ===== 2. Recache (必须在 LLM Agent 处理之前) =====
-                # 重置 kv_cache 和 crossattn_cache
+                # ===== 2. Prompt 切换处理 (必须在 LLM Agent 处理之前) =====
                 if profile:
                     recache_start.record()
 
-                self._recache_after_switch(output, current_start_frame, cond_list[segment_idx])
+                if self.spt_enabled:
+                    self._soft_switch()
+                    # IAM: 即使不 recache，也需要清空 kv_bank 索引，避免沿用旧 prompt 的 memory
+                    if self.kv_bank1 is not None:
+                        for blk in self.kv_bank1:
+                            blk["local_end_index"].zero_()
+                            blk["global_end_index"].zero_()
+                        self._iam_bank_length = 0
+                        if DEBUG:
+                            print(f"[AgentPipeline] Reset kv_bank indices for prompt switch (SPT)")
+                else:
+                    # 重置 kv_cache 和 crossattn_cache（包含 kv_bank 索引重置）
+                    self._recache_after_switch(output, current_start_frame, cond_list[segment_idx])
 
                 if profile:
                     recache_end.record()
@@ -302,6 +313,8 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
 
             cond_in_use = cond_list[segment_idx]
             noisy_input = noise[:, current_start_frame:current_start_frame + current_num_frames]
+            # SPT: 获取当前过渡系数（按 chunk 采样，alpha 在一个 chunk 内保持不变）
+            transition_alpha = self._get_current_transition_alpha() if self.spt_enabled else None
 
             # ===== 4. 空间去噪循环 =====
             for index, current_timestep in enumerate(self.denoising_step_list):
@@ -329,6 +342,8 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
                         update_bank=False,  # 关键: 始终 False
                         q_bank=q_bank,
                         iam_bank_length=self._iam_bank_length,  # P0 优化
+                        prev_crossattn_cache=self.prev_crossattn_cache,
+                        transition_alpha=transition_alpha,
                     )
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
@@ -351,6 +366,8 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
                         update_bank=False,  # 关键: 始终 False
                         q_bank=q_bank,
                         iam_bank_length=self._iam_bank_length,  # P0 优化
+                        prev_crossattn_cache=self.prev_crossattn_cache,
+                        transition_alpha=transition_alpha,
                     )
 
             # 记录输出
@@ -390,7 +407,12 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
                 q_bank=q_bank,
                 update_cache=True,
                 iam_bank_length=self._iam_bank_length,  # P0 优化
+                prev_crossattn_cache=self.prev_crossattn_cache,
+                transition_alpha=transition_alpha,
             )
+
+            if self.spt_enabled:
+                self._update_transition_state(current_num_frames)
 
             if profile:
                 block_end.record()

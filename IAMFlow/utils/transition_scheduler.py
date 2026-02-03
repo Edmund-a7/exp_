@@ -41,6 +41,8 @@ class TransitionScheduler(ABC):
 
         Args:
             frames_since_switch: 切换后已生成的帧数
+                - 交互推理当前为按 chunk 采样：该值通常按 chunk 长度递增，
+                  因此 α 也按 chunk 更新（而非逐帧）
         Returns:
             α 值 (0~1)，None 表示过渡已完成
         """
