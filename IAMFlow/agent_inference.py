@@ -90,19 +90,11 @@ llm_model_path = args.llm_model_path or getattr(config, "llm_model_path", "../Qw
 max_memory_frames = args.max_memory_frames if args.max_memory_frames is not None else getattr(config, "max_memory_frames", 3)
 save_dir = args.save_dir or getattr(config, "save_dir", "data/agent_frames")
 
-# LLM optimization parameters (for FP8 models like Qwen3-4B-FP8)
-llm_dtype = getattr(config, "llm_dtype", "auto")
-llm_gpu_memory_utilization = getattr(config, "llm_gpu_memory_utilization", 0.5)
-llm_max_model_len = getattr(config, "llm_max_model_len", 4096)
-
 if local_rank == 0:
     print("=" * 60)
     print("IAM Agent Single Prompt Inference")
     print("=" * 60)
     print(f"LLM Model Path: {llm_model_path}")
-    print(f"LLM dtype: {llm_dtype}")
-    print(f"LLM GPU Memory Utilization: {llm_gpu_memory_utilization}")
-    print(f"LLM Max Model Length: {llm_max_model_len}")
     print(f"Max Memory Frames: {max_memory_frames}")
     print(f"Save Directory: {save_dir}")
     print("=" * 60)
@@ -113,9 +105,6 @@ pipeline = AgentCausalInferencePipeline(
     llm_model_path=llm_model_path,
     max_memory_frames=max_memory_frames,
     save_dir=save_dir,
-    llm_dtype=llm_dtype,
-    llm_gpu_memory_utilization=llm_gpu_memory_utilization,
-    llm_max_model_len=llm_max_model_len,
 )
 
 # ----------------------------- Load base checkpoint -----------------------------

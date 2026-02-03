@@ -55,9 +55,6 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         save_dir: str = "data/agent_frames",
         save_frames_to_disk: bool = False,
         use_vllm: bool = True,
-        llm_dtype: str = "auto",
-        llm_gpu_memory_utilization: float = 0.5,
-        llm_max_model_len: int = 4096,
     ):
         """
         初始化 Agent Pipeline
@@ -71,22 +68,13 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             llm_model_path: LLM 模型路径
             max_memory_frames: 最大记忆帧数量
             save_dir: 帧数据保存目录
-            save_frames_to_disk: 是否将帧 KV 保存到磁盘 (默认False，仅保存在内存中以提升性能)
+            save_frames_to_disk: 是否将帧 KV 保存到磁盘
             use_vllm: 是否使用 vLLM 加速 (默认True)
-            llm_dtype: LLM 数据类型 ("auto" 支持 FP8 预量化模型)
-            llm_gpu_memory_utilization: LLM GPU 显存利用率
-            llm_max_model_len: LLM 最大序列长度
         """
         super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae)
 
         # 初始化 LLM Agent
-        self.llm_agent = LLMAgent(
-            model_path=llm_model_path,
-            use_vllm=use_vllm,
-            dtype=llm_dtype,
-            gpu_memory_utilization=llm_gpu_memory_utilization,
-            max_model_len=llm_max_model_len,
-        )
+        self.llm_agent = LLMAgent(model_path=llm_model_path, use_vllm=use_vllm)
 
         # 初始化 Memory Bank (使用父类的 text_encoder)
         self.agent_memory_bank = MemoryBank(
@@ -802,9 +790,6 @@ def create_agent_pipeline(
     max_memory_frames: int = 3,
     save_dir: str = "data/agent_frames",
     use_vllm: bool = True,
-    llm_dtype: str = "auto",
-    llm_gpu_memory_utilization: float = 0.5,
-    llm_max_model_len: int = 4096,
 ) -> AgentCausalInferencePipeline:
     """
     创建 Agent Pipeline 的便捷函数
@@ -816,9 +801,6 @@ def create_agent_pipeline(
         max_memory_frames: 最大记忆帧数
         save_dir: 帧保存目录
         use_vllm: 是否使用 vLLM 加速
-        llm_dtype: LLM 数据类型 ("auto" 支持 FP8)
-        llm_gpu_memory_utilization: LLM GPU 显存利用率
-        llm_max_model_len: LLM 最大序列长度
 
     Returns:
         AgentCausalInferencePipeline 实例
@@ -830,9 +812,6 @@ def create_agent_pipeline(
         max_memory_frames=max_memory_frames,
         save_dir=save_dir,
         use_vllm=use_vllm,
-        llm_dtype=llm_dtype,
-        llm_gpu_memory_utilization=llm_gpu_memory_utilization,
-        llm_max_model_len=llm_max_model_len,
     )
     return pipeline
 

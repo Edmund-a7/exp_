@@ -48,15 +48,7 @@ class EntityStruct:
 class LLMWrapper:
     """LLM封装类，支持 HuggingFace Transformers 和 vLLM 两种后端"""
 
-    def __init__(
-        self,
-        model_path: str = "../Qwen3-0.6B",
-        device: str = None,
-        use_vllm: bool = True,
-        dtype: str = "auto",
-        gpu_memory_utilization: float = 0.5,
-        max_model_len: int = 4096,
-    ):
+    def __init__(self, model_path: str = "../Qwen3-0.6B", device: str = None, use_vllm: bool = True):
         """
         初始化 LLM 封装类
 
@@ -64,10 +56,6 @@ class LLMWrapper:
             model_path: 模型路径
             device: 设备 (仅 HF 后端使用)
             use_vllm: 是否使用 vLLM 后端 (默认 True，更快)
-            dtype: 数据类型 ("auto", "bfloat16", "float16", "float32")
-                   - "auto": 自动检测，支持 FP8 预量化模型
-            gpu_memory_utilization: GPU 显存利用率 (0.0-1.0)
-            max_model_len: 最大序列长度
         """
         self.model_path = model_path
         self._model = None
@@ -75,10 +63,6 @@ class LLMWrapper:
         self._device = device
         self._use_vllm = use_vllm
         self._sampling_params = None
-        # 新增配置
-        self._dtype = dtype
-        self._gpu_memory_utilization = gpu_memory_utilization
-        self._max_model_len = max_model_len
 
     def preload(self):
         """预加载模型并执行 warmup，避免第一次 generate 时的延迟"""
@@ -109,20 +93,18 @@ class LLMWrapper:
             self._load_hf_model()
 
     def _load_vllm_model(self):
-        """使用 vLLM 加载模型，支持 FP8 预量化模型"""
+        """使用 vLLM 加载模型"""
         try:
             from vllm import LLM, SamplingParams
 
             print(f"[LLMWrapper] Loading model with vLLM from {self.model_path}")
-            print(f"[LLMWrapper] Config: dtype={self._dtype}, "
-                  f"gpu_mem={self._gpu_memory_utilization}, max_len={self._max_model_len}")
 
             self._model = LLM(
                 model=self.model_path,
                 trust_remote_code=True,
-                dtype=self._dtype,
-                gpu_memory_utilization=self._gpu_memory_utilization,
-                max_model_len=self._max_model_len,
+                dtype="bfloat16",
+                gpu_memory_utilization=0.3,
+                max_model_len=2048,
             )
             self._tokenizer = self._model.get_tokenizer()
             self._sampling_params = SamplingParams
@@ -511,22 +493,9 @@ class LLMAgent:
     3. 返回实体列表和registry更新信息
     """
 
-    def __init__(
-        self,
-        model_path: str = "../Qwen3-0.6B",
-        use_vllm: bool = True,
-        dtype: str = "auto",
-        gpu_memory_utilization: float = 0.5,
-        max_model_len: int = 4096,
-    ):
+    def __init__(self, model_path: str = "../Qwen3-0.6B", use_vllm: bool = True):
         # 共享同一个LLM实例
-        self.llm = LLMWrapper(
-            model_path,
-            use_vllm=use_vllm,
-            dtype=dtype,
-            gpu_memory_utilization=gpu_memory_utilization,
-            max_model_len=max_model_len,
-        )
+        self.llm = LLMWrapper(model_path, use_vllm=use_vllm)
         self.extractor = EntityStructExtractor(llm=self.llm)
         self.id_manager = GlobalIDManager(llm=self.llm)
 
