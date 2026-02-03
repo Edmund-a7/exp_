@@ -136,7 +136,8 @@ class WanDiffusionWrapper(torch.nn.Module):
             tcat_enabled=False,
             tcat_sink_k=1,
             tcat_mem_k=2,
-            tcat_local_k=6,
+            tcat_local_k=3,
+            tcat_local_near=3,
             tcat_ema_alpha=0.3,
     ):
         super().__init__()
@@ -154,6 +155,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 tcat_sink_k=tcat_sink_k,
                 tcat_mem_k=tcat_mem_k,
                 tcat_local_k=tcat_local_k,
+                tcat_local_near=tcat_local_near,
                 tcat_ema_alpha=tcat_ema_alpha,
             )
         else:

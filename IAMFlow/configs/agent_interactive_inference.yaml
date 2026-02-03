@@ -21,7 +21,9 @@ model_kwargs:
   tcat_enabled: True
   tcat_sink_k: 1   # Select top-1 from Sink region (3 chunks)
   tcat_mem_k: 2    # Select top-2 from Mem region (3 chunks)
-  tcat_local_k: 3  # Select top-3 from Local region (9 chunks)
+  tcat_local_k: 3  # Select top-3 from Local-far region (6 chunks)
+  tcat_local_near: 3  # Preserve last 3 chunks (most recent frames)
+  tcat_ema_alpha: 0.3  # EMA smoothing factor (0=disabled)
 
 # Inference
 data_path: prompts/interactive_example.jsonl
