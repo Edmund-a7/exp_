@@ -310,6 +310,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             init_time = init_start.elapsed_time(init_end)
             vae_start.record()
 
+        # 释放 KV cache 内存以便 VAE 解码
+        self._free_kv_memory()
+
         # Standard decoding
         video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False)
         video = (video * 0.5 + 0.5).clamp(0, 1)
