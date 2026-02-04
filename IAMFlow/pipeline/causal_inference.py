@@ -359,6 +359,42 @@ class CausalInferencePipeline(torch.nn.Module):
                     blk["local_end_index"].zero_()
                 # if "global_end_index" in blk:
                 #     blk["global_end_index"].zero_()
+
+    def _free_kv_memory(self):
+        """
+        Actually free KV cache memory before VAE decode.
+        Unlike clear_kv_cache() which only zeros values, this method
+        deletes tensors and releases GPU memory.
+        """
+        import torch
+
+        # Free KV cache
+        if getattr(self, "kv_cache1", None) is not None:
+            for blk in self.kv_cache1:
+                blk.clear()
+            self.kv_cache1 = None
+
+        # Free KV bank
+        if getattr(self, "kv_bank1", None) is not None:
+            for blk in self.kv_bank1:
+                blk.clear()
+            self.kv_bank1 = None
+
+        # Free cross-attention cache
+        if getattr(self, "crossattn_cache", None) is not None:
+            for blk in self.crossattn_cache:
+                blk.clear()
+            self.crossattn_cache = None
+
+        # Free prev_crossattn_cache (SPT)
+        if getattr(self, "prev_crossattn_cache", None) is not None:
+            for blk in self.prev_crossattn_cache:
+                blk.clear()
+            self.prev_crossattn_cache = None
+
+        # Release memory back to CUDA
+        torch.cuda.empty_cache()
+
     def _set_all_modules_max_attention_size(self, local_attn_size_value: int):
         """
         Set max_attention_size on all submodules that define it.

@@ -55,6 +55,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         save_dir: str = "data/agent_frames",
         save_frames_to_disk: bool = False,
         use_vllm: bool = True,
+        gpu_memory_utilization: float = 0.2,
     ):
         """
         初始化 Agent Pipeline
@@ -70,11 +71,13 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             save_dir: 帧数据保存目录
             save_frames_to_disk: 是否将帧 KV 保存到磁盘
             use_vllm: 是否使用 vLLM 加速 (默认True)
+            gpu_memory_utilization: vLLM GPU 显存利用率 (默认0.2，低并发场景)
         """
         super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae)
 
         # 初始化 LLM Agent
-        self.llm_agent = LLMAgent(model_path=llm_model_path, use_vllm=use_vllm)
+        self.llm_agent = LLMAgent(model_path=llm_model_path, use_vllm=use_vllm,
+                                  gpu_memory_utilization=gpu_memory_utilization)
 
         # 初始化 Memory Bank (使用父类的 text_encoder)
         self.agent_memory_bank = MemoryBank(
@@ -430,6 +433,12 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             init_time = init_start.elapsed_time(init_end)
             vae_start.record()
 
+        # 释放 KV cache 内存以便 VAE 解码
+        self._free_kv_memory()
+        # 清空 IAM memory bank
+        if hasattr(self, "agent_memory_bank"):
+            self.agent_memory_bank.clear_frame_store()
+
         # 解码视频
         video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False)
         video = (video * 0.5 + 0.5).clamp(0, 1)
@@ -438,8 +447,6 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             vae_end.record()
             torch.cuda.synchronize()
             vae_time = vae_start.elapsed_time(vae_end)
-
-        self.clear_kv_cache()
 
         # 保存 mapping
         if save_mapping:
@@ -812,6 +819,7 @@ def create_agent_pipeline(
     max_memory_frames: int = 3,
     save_dir: str = "data/agent_frames",
     use_vllm: bool = True,
+    gpu_memory_utilization: float = 0.2,
 ) -> AgentCausalInferencePipeline:
     """
     创建 Agent Pipeline 的便捷函数
@@ -823,6 +831,7 @@ def create_agent_pipeline(
         max_memory_frames: 最大记忆帧数
         save_dir: 帧保存目录
         use_vllm: 是否使用 vLLM 加速
+        gpu_memory_utilization: vLLM GPU 显存利用率 (默认0.2)
 
     Returns:
         AgentCausalInferencePipeline 实例
@@ -834,6 +843,7 @@ def create_agent_pipeline(
         max_memory_frames=max_memory_frames,
         save_dir=save_dir,
         use_vllm=use_vllm,
+        gpu_memory_utilization=gpu_memory_utilization,
     )
     return pipeline
 

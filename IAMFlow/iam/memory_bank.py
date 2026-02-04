@@ -741,6 +741,14 @@ class MemoryBank:
         self.frame_active_memory = []
         self._frame_kv_store = {}
 
+    def clear_frame_store(self) -> None:
+        """
+        只清空帧 KV 存储，释放 GPU 显存。
+        保留 registry 和 archive 元数据。
+        用于 VAE decode 前释放显存。
+        """
+        self._frame_kv_store = {}
+
     # ============ 辅助方法 ============
 
     def build_entity_attrs_query(self, entities: List[EntityStruct]) -> str:
