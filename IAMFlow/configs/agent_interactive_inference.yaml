@@ -16,9 +16,9 @@ model_kwargs:
   sink_size: 3
   bank_size: 3
   record_interval: 3
-  SMA: False  # Disabled when using TCAT
+  SMA: True   # Enabled (TCAT disabled)
   # TCAT: Temporal Coverage Aware Top-k
-  tcat_enabled: True
+  tcat_enabled: False
   tcat_sink_k: 1   # Select top-1 from Sink region (3 chunks)
   tcat_mem_k: 2    # Select top-2 from Mem region (3 chunks)
   tcat_local_k: 3  # Select top-3 from Local-far region (6 chunks)
