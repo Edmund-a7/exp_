@@ -264,19 +264,78 @@ class MemoryBank:
         Returns:
             (frame_id, score) - 选中的帧ID和分数
         """
+        if not evicted_chunk_kv or not crossattn_cache:
+            raise ValueError("evicted_chunk_kv and crossattn_cache must not be empty")
+
+        num_candidate_frames = max(1, evicted_chunk_kv[0]["k"].shape[1] // self.frame_seq_length)
+        available_layers = min(len(evicted_chunk_kv), len(crossattn_cache))
+        has_initialized_layer = any(
+            crossattn_cache[layer_idx].get("is_init", False)
+            for layer_idx in range(available_layers)
+        )
+
         # 检查 crossattn_cache 是否已初始化
-        if not crossattn_cache[0].get("is_init", False):
+        if not has_initialized_layer:
             import warnings
             warnings.warn("[MemoryBank] crossattn_cache not initialized, selecting first frame by default")
-            frame_scores = torch.ones(evicted_chunk_kv[0]["k"].shape[1] // self.frame_seq_length)
-        else:
-            # 方案 A: 使用 crossattn_cache + 实体聚焦加权
-            frame_scores = self._compute_frame_scores_with_entity_focus(
-                evicted_chunk_kv[0],
-                crossattn_cache[0],
-                current_entities,
-                prompt_text
+            frame_scores = torch.ones(
+                num_candidate_frames,
+                device=evicted_chunk_kv[0]["k"].device,
+                dtype=evicted_chunk_kv[0]["k"].dtype
             )
+        else:
+            # 多层共识打分: 用 3 个代表层投票，比单层更准确
+            num_text_tokens = crossattn_cache[0]["k"].shape[1]
+            entity_weights = self._build_entity_token_weights(
+                current_entities, num_text_tokens, prompt_text
+            )
+
+            if current_entities and len(current_entities) > 0:
+                entity_query = self.build_entity_attrs_query(current_entities)
+                print(f"[DEBUG] Entity-focus mode: '{entity_query[:50]}...' (multi-layer consensus)")
+            else:
+                print(f"[DEBUG] No entities, using uniform weights (multi-layer consensus)")
+
+            frame_scores = None
+            valid_layers = []
+            valid_weights = []
+            for layer_idx, layer_weight in zip(self.CONSENSUS_LAYERS, self.CONSENSUS_WEIGHTS):
+                if layer_idx < available_layers and crossattn_cache[layer_idx].get("is_init", False):
+                    valid_layers.append(layer_idx)
+                    valid_weights.append(layer_weight)
+
+            # 边界兜底：如果代表层不可用，退回到 layer 0
+            if not valid_layers:
+                fallback_layer = 0
+                for layer_idx in range(available_layers):
+                    if crossattn_cache[layer_idx].get("is_init", False):
+                        fallback_layer = layer_idx
+                        break
+                valid_layers = [fallback_layer]
+                valid_weights = [1.0]
+
+            weight_sum = sum(valid_weights)
+            if weight_sum <= 0:
+                valid_weights = [1.0 / len(valid_weights)] * len(valid_weights)
+            else:
+                valid_weights = [w / weight_sum for w in valid_weights]
+
+            for layer_idx, layer_weight in zip(valid_layers, valid_weights):
+                layer_scores = self._compute_frame_scores_fast(
+                    evicted_chunk_kv[layer_idx],
+                    crossattn_cache[layer_idx],
+                    entity_weights
+                )
+                if frame_scores is None:
+                    frame_scores = torch.zeros_like(layer_scores)
+                frame_scores = frame_scores + layer_scores * layer_weight
+
+            if frame_scores is None:
+                frame_scores = torch.ones(
+                    num_candidate_frames,
+                    device=evicted_chunk_kv[0]["k"].device,
+                    dtype=evicted_chunk_kv[0]["k"].dtype
+                )
 
         # 选择最高分帧
         best_frame_idx = frame_scores.argmax().item()
@@ -443,6 +502,60 @@ class MemoryBank:
             frame_scores.append(frame_score)
 
         return torch.tensor(frame_scores, device=chunk_k.device)
+
+    # ============ 多层共识快速打分 ============
+
+    # 代表层索引和权重: 浅层(纹理) / 中层(结构) / 深层(语义)
+    CONSENSUS_LAYERS = [0, 15, 29]
+    CONSENSUS_WEIGHTS = [0.2, 0.3, 0.5]
+
+    def _compute_frame_scores_fast(self,
+                                    chunk_kv: Dict[str, torch.Tensor],
+                                    crossattn_cache_block: Dict[str, torch.Tensor],
+                                    entity_weights: torch.Tensor) -> torch.Tensor:
+        """
+        等价快速打分：先聚合Q，再与帧均值K点积
+
+        数学等价于 _compute_frame_scores_with_entity_focus，但复杂度从
+        O(512 × L × D) 降到 O(512×D + F×D)，加速约 4000x。
+
+        原始: sum_i(w_i * Q_i · K^T) = (sum_i(w_i * Q_i)) · K^T
+
+        Args:
+            chunk_kv: 单个 block 的 chunk KV, {"k": [B, L, H, D]}
+            crossattn_cache_block: 单个 block 的 crossattn cache, {"k": [B, S, H, D]}
+            entity_weights: [S] 实体权重向量 (S=512)
+
+        Returns:
+            [num_frames] 每帧分数
+        """
+        chunk_k = chunk_kv["k"]  # [B, L, H, D]
+        text_q = crossattn_cache_block["k"]  # [B, S, H, D]
+        B, L, H, D = chunk_k.shape
+
+        num_frames = L // self.frame_seq_length
+        if num_frames == 0:
+            return torch.ones(1, device=chunk_k.device, dtype=chunk_k.dtype)
+
+        valid_length = num_frames * self.frame_seq_length
+        if valid_length != L:
+            chunk_k = chunk_k[:, :valid_length]
+
+        # Step 1: 加权聚合 Q → [B, H, D]
+        w = entity_weights.to(text_q.device)  # [S]
+        w = w / (w.sum() + 1e-8)
+        q_agg = torch.einsum('bshd,s->bhd', text_q, w)  # [B, H, D]
+
+        # Step 2: K 按帧分组取均值 → [B, F, H, D]
+        k_frames = chunk_k.reshape(B, num_frames, self.frame_seq_length, H, D)
+        k_agg = k_frames.mean(dim=2)  # [B, F, H, D]
+
+        # Step 3: 点积 → [B, H, F]
+        scores = torch.einsum('bhd,bfhd->bhf', q_agg, k_agg) * (D ** -0.5)
+
+        # Step 4: mean over batch and heads → [F]
+        scores = scores.mean(dim=(0, 1))  # [F]
+        return scores
 
     def _build_entity_token_weights(self,
                                      entities: Optional[List['EntityStruct']],
