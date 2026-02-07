@@ -136,11 +136,16 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         SPT: 软切换 - 保存旧 prompt 的 K,V，准备渐变过渡
         不执行 recache，而是在后续帧中逐渐混合新旧 prompt
         """
-        # 保存旧 prompt 的 cross-attention K,V
-        self.prev_crossattn_cache = [
-            {"k": blk["k"].clone(), "v": blk["v"].clone()}
-            for blk in self.crossattn_cache
-        ]
+        # 保存旧 prompt 的 cross-attention K,V (原地拷贝到预分配的 buffer)
+        if self.prev_crossattn_cache is not None and len(self.prev_crossattn_cache) == len(self.crossattn_cache):
+            for prev_blk, blk in zip(self.prev_crossattn_cache, self.crossattn_cache):
+                prev_blk["k"].copy_(blk["k"])
+                prev_blk["v"].copy_(blk["v"])
+        else:
+            self.prev_crossattn_cache = [
+                {"k": blk["k"].clone(), "v": blk["v"].clone()}
+                for blk in self.crossattn_cache
+            ]
         self.frames_since_switch = 0
 
         # 重置 crossattn_cache，让新 prompt 的 K,V 在下次 forward 时计算
@@ -163,10 +168,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         self.frames_since_switch += num_frames
 
         if self.transition_scheduler.is_complete(self.frames_since_switch):
-            # 过渡完成，释放旧 cache
-            self.prev_crossattn_cache = None
+            # 过渡完成，保留预分配 buffer 供下次复用，仅重置状态标志
             self.frames_since_switch = None
-            print("[SPT] Transition complete, released prev_crossattn_cache")
+            print("[SPT] Transition complete")
 
     @staticmethod
     def _compute_prompt_distance(cond_old: dict, cond_new: dict) -> float:

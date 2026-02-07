@@ -306,6 +306,16 @@ class CausalInferencePipeline(torch.nn.Module):
             })
         self.crossattn_cache = crossattn_cache
 
+        # SPT: 预分配 prev_crossattn_cache，避免首次 soft_switch 时 cudaMalloc
+        if getattr(self, "spt_enabled", False):
+            self.prev_crossattn_cache = [
+                {
+                    "k": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
+                    "v": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
+                }
+                for _ in range(self.num_transformer_blocks)
+            ]
+
     def _initialize_kv_bank(self, batch_size, dtype, device, kv_bank1_size):
         """
         Initialize a Per-GPU KV bank for the Wan model.
