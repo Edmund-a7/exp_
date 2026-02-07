@@ -7,12 +7,12 @@
 # No warranties are given. The work is provided "AS IS", without warranty of any kind, express or implied.
 #
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
-from typing import List, Optional
+from typing import List, Optional, Union
 import torch
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from utils.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation
-from utils.transition_scheduler import create_scheduler, TransitionScheduler
+from utils.transition_scheduler import create_scheduler, TransitionScheduler, AdaptiveScheduler
 from pipeline.causal_inference import CausalInferencePipeline
 import torch.distributed as dist
 from utils.debug_option import DEBUG
@@ -35,18 +35,29 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         self.spt_enabled = getattr(args, "spt_enabled", False)
         self.prev_crossattn_cache = None
         self.frames_since_switch = None
-        self.transition_scheduler: Optional[TransitionScheduler] = None
+        self.transition_scheduler: Optional[Union[TransitionScheduler, AdaptiveScheduler]] = None
 
         if self.spt_enabled:
             spt_config = getattr(args, "spt", None)
             if spt_config:
-                self.transition_scheduler = create_scheduler(
-                    scheduler_type=getattr(spt_config, "scheduler_type", "cosine"),
-                    window_frames=getattr(spt_config, "window_frames", 9),
-                    delay_frames=getattr(spt_config, "delay_frames", 3),
-                    steepness=getattr(spt_config, "steepness", 6.0),
-                    frames_per_chunk=getattr(spt_config, "frames_per_chunk", 3),
-                )
+                scheduler_type = getattr(spt_config, "scheduler_type", "cosine")
+                if scheduler_type == "adaptive":
+                    self.transition_scheduler = AdaptiveScheduler(
+                        base_scheduler_type=getattr(spt_config, "base_scheduler", "cosine"),
+                        min_window=getattr(spt_config, "min_window", 3),
+                        max_window=getattr(spt_config, "max_window", 15),
+                        delay_frames=getattr(spt_config, "delay_frames", 3),
+                        steepness=getattr(spt_config, "steepness", 6.0),
+                        frames_per_chunk=getattr(spt_config, "frames_per_chunk", 3),
+                    )
+                else:
+                    self.transition_scheduler = create_scheduler(
+                        scheduler_type=scheduler_type,
+                        window_frames=getattr(spt_config, "window_frames", 9),
+                        delay_frames=getattr(spt_config, "delay_frames", 3),
+                        steepness=getattr(spt_config, "steepness", 6.0),
+                        frames_per_chunk=getattr(spt_config, "frames_per_chunk", 3),
+                    )
             else:
                 self.transition_scheduler = create_scheduler()
             print(f"[SPT] Enabled with {type(self.transition_scheduler).__name__}")
@@ -157,6 +168,27 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             self.frames_since_switch = None
             print("[SPT] Transition complete, released prev_crossattn_cache")
 
+    @staticmethod
+    def _compute_prompt_distance(cond_old: dict, cond_new: dict) -> float:
+        """
+        计算两个 prompt embedding 的 cosine distance
+
+        复用已有的 cond_list（text_encoder 输出），不需要额外编码。
+
+        Args:
+            cond_old: 旧 prompt 的 conditional_dict (包含 "prompt_embeds" key)
+            cond_new: 新 prompt 的 conditional_dict
+
+        Returns:
+            cosine distance: 0=相同, 1=完全不同
+        """
+        import torch.nn.functional as F
+        # prompt_embeds shape: [B, 512, D]
+        emb_old = cond_old["prompt_embeds"].mean(dim=(0, 1))  # [D]
+        emb_new = cond_new["prompt_embeds"].mean(dim=(0, 1))  # [D]
+        cos_sim = F.cosine_similarity(emb_old.unsqueeze(0), emb_new.unsqueeze(0))
+        return (1.0 - cos_sim.item())
+
     def inference(
         self,
         noise: torch.Tensor,
@@ -261,6 +293,12 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 segment_idx += 1
                 # SPT: 使用软切换或传统 recache
                 if self.spt_enabled:
+                    # Adaptive SPT: 根据语义距离动态调整窗口
+                    if isinstance(self.transition_scheduler, AdaptiveScheduler):
+                        dist = self._compute_prompt_distance(
+                            cond_list[segment_idx - 1], cond_list[segment_idx]
+                        )
+                        self.transition_scheduler.update_for_switch(dist)
                     self._soft_switch()
                 else:
                     self._recache_after_switch(output, current_start_frame, cond_list[segment_idx])

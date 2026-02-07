@@ -41,11 +41,14 @@ context_noise: 0
 # SPT: Soft Prompt Transition
 spt_enabled: true  # Set to true to enable soft transition (disables recache)
 spt:
-  scheduler_type: cosine  # linear, cosine, sigmoid, step
-  window_frames: 9        # Transition window (3 chunks, alpha 按 chunk 更新)
-  delay_frames: 3         # Delay before blending starts (1 chunk, alpha 按 chunk 更新)
-  steepness: 6.0          # Sigmoid scheduler only
-  frames_per_chunk: 3     # Step scheduler only
+  scheduler_type: adaptive  # linear, cosine, sigmoid, step, adaptive
+  base_scheduler: cosine    # Adaptive only: 底层调度曲线
+  min_window: 3             # Adaptive only: 最短过渡窗口 (1 chunk)
+  max_window: 15            # Adaptive only: 最长过渡窗口 (5 chunks)
+  window_frames: 9          # Non-adaptive: 固定过渡窗口
+  delay_frames: 3           # Delay before blending starts (1 chunk)
+  steepness: 6.0            # Sigmoid scheduler only
+  frames_per_chunk: 3       # Step scheduler only
 
 # Checkpoints
 generator_ckpt: checkpoints/base.pt

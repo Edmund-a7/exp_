@@ -134,6 +134,87 @@ class StepScheduler(TransitionScheduler):
         return (step + 1) / self.num_steps
 
 
+class AdaptiveScheduler:
+    """
+    自适应调度器：根据语义距离动态调整过渡窗口大小
+
+    原理：
+    - 语义距离小（如"走路→跑步"）→ 短窗口，避免混合期过长导致运动模糊
+    - 语义距离大（如"公园→雪山"）→ 长窗口，避免过渡太快产生伪影
+
+    用法：
+    1. __init__ 时创建，此时内部 scheduler 使用默认 window
+    2. 每次 prompt 切换时调用 update_for_switch(distance) 动态创建新 scheduler
+    """
+
+    def __init__(self,
+                 base_scheduler_type: str = "cosine",
+                 min_window: int = 3,
+                 max_window: int = 15,
+                 delay_frames: int = 3,
+                 **scheduler_kwargs):
+        """
+        Args:
+            base_scheduler_type: 底层调度曲线类型 (linear, cosine, sigmoid, step)
+            min_window: 最短过渡窗口 (帧)
+            max_window: 最长过渡窗口 (帧)
+            delay_frames: 延迟启动帧数
+            **scheduler_kwargs: 传递给底层 scheduler 的额外参数
+        """
+        self.base_scheduler_type = base_scheduler_type
+        self.min_window = min_window
+        self.max_window = max_window
+        self.delay_frames = delay_frames
+        self.scheduler_kwargs = scheduler_kwargs
+
+        # 初始化一个默认 scheduler（使用 max_window 作为保守默认值）
+        self._active_scheduler: TransitionScheduler = create_scheduler(
+            scheduler_type=base_scheduler_type,
+            window_frames=max_window,
+            delay_frames=delay_frames,
+            **scheduler_kwargs
+        )
+
+    def update_for_switch(self, semantic_distance: float):
+        """
+        prompt 切换时调用，根据语义距离创建对应窗口的 scheduler
+
+        Args:
+            semantic_distance: cosine distance (0=相同, 1=完全不同)
+        """
+        t = max(0.0, min(1.0, semantic_distance))
+        window = int(self.min_window + t * (self.max_window - self.min_window))
+        # 对齐到 chunk 边界 (3帧一个chunk)，最小 3 帧
+        window = max(3, (window // 3) * 3)
+
+        self._active_scheduler = create_scheduler(
+            scheduler_type=self.base_scheduler_type,
+            window_frames=window,
+            delay_frames=self.delay_frames,
+            **self.scheduler_kwargs
+        )
+
+        print(f"[SPT-Adaptive] semantic_distance={t:.3f}, window_frames={window}")
+
+    def get_alpha(self, frames_since_switch: int) -> Optional[float]:
+        """代理到内部 scheduler"""
+        return self._active_scheduler.get_alpha(frames_since_switch)
+
+    def is_complete(self, frames_since_switch: int) -> bool:
+        """代理到内部 scheduler"""
+        return self._active_scheduler.is_complete(frames_since_switch)
+
+    @property
+    def total_frames(self) -> int:
+        """代理到内部 scheduler"""
+        return self._active_scheduler.total_frames
+
+    @property
+    def window_frames(self) -> int:
+        """代理到内部 scheduler"""
+        return self._active_scheduler.window_frames
+
+
 def create_scheduler(
     scheduler_type: str = "cosine",
     window_frames: int = 9,

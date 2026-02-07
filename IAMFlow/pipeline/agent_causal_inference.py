@@ -113,6 +113,16 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         # IAM: MemFlow 的 NAM 和 SMA 代码已从 causal_model.py 中删除
         # 不再需要禁用标志
 
+    @staticmethod
+    def _compute_prompt_distance(cond_old: dict, cond_new: dict) -> float:
+        """计算两个 prompt embedding 的 cosine distance。"""
+        import torch.nn.functional as F
+
+        emb_old = cond_old["prompt_embeds"].mean(dim=(0, 1))
+        emb_new = cond_new["prompt_embeds"].mean(dim=(0, 1))
+        cos_sim = F.cosine_similarity(emb_old.unsqueeze(0), emb_new.unsqueeze(0))
+        return (1.0 - cos_sim.item())
+
     def inference(
         self,
         noise: torch.Tensor,
@@ -269,6 +279,13 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
                     recache_start.record()
 
                 if self.spt_enabled:
+                    # Adaptive SPT: 根据语义距离动态调整窗口
+                    scheduler = getattr(self, "transition_scheduler", None)
+                    if hasattr(scheduler, "update_for_switch"):
+                        dist = self._compute_prompt_distance(
+                            cond_list[segment_idx - 1], cond_list[segment_idx]
+                        )
+                        scheduler.update_for_switch(dist)
                     self._soft_switch()
                     # IAM: 即使不 recache，也需要清空 kv_bank 索引，避免沿用旧 prompt 的 memory
                     if self.kv_bank1 is not None:
@@ -434,7 +451,11 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             vae_start.record()
 
         # 释放 KV cache 内存以便 VAE 解码
-        self._free_kv_memory()
+        free_kv_memory = getattr(self, "_free_kv_memory", None)
+        if callable(free_kv_memory):
+            free_kv_memory()
+        else:
+            self.clear_kv_cache()
         # 清空 IAM memory bank
         if hasattr(self, "agent_memory_bank"):
             self.agent_memory_bank.clear_frame_store()
