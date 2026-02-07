@@ -394,7 +394,7 @@ class MemoryBank:
         # 计算帧数
         num_frames = L // self.frame_seq_length
         if num_frames == 0:
-            return torch.tensor([1.0], device=chunk_k.device)
+            return torch.tensor([1.0], device=chunk_k.device, dtype=chunk_k.dtype)
 
         # 按 MemFlow compress_kv_bank 的方式计算注意力分数
         # q_reshaped: [B*H, 512, D]
@@ -420,7 +420,7 @@ class MemoryBank:
             frame_score = scores_per_token[:, start:end].mean()  # scalar
             frame_scores.append(frame_score)
 
-        return torch.tensor(frame_scores, device=chunk_k.device)
+        return torch.tensor(frame_scores, device=chunk_k.device, dtype=chunk_k.dtype)
 
     def _compute_frame_scores_with_entity_focus(self,
                                                   chunk_kv: Dict[str, torch.Tensor],
@@ -457,7 +457,7 @@ class MemoryBank:
         # 计算帧数
         num_frames = L // self.frame_seq_length
         if num_frames == 0:
-            return torch.tensor([1.0], device=chunk_k.device)
+            return torch.tensor([1.0], device=chunk_k.device, dtype=chunk_k.dtype)
 
         # Step 1: 计算完整的 token-to-position 注意力矩阵
         # q_reshaped: [B*H, 512, D]
@@ -470,7 +470,7 @@ class MemoryBank:
 
         # Step 2: 构建实体权重向量 [512]
         entity_weights = self._build_entity_token_weights(entities, num_text_tokens, prompt_text)
-        entity_weights = entity_weights.to(chunk_k.device)  # [512]
+        entity_weights = entity_weights.to(device=chunk_k.device, dtype=chunk_k.dtype)  # [512]
 
         if entities is not None and len(entities) > 0:
             entity_query = self.build_entity_attrs_query(entities)
@@ -501,7 +501,7 @@ class MemoryBank:
             frame_score = scores_per_position[:, start:end].mean()  # scalar
             frame_scores.append(frame_score)
 
-        return torch.tensor(frame_scores, device=chunk_k.device)
+        return torch.tensor(frame_scores, device=chunk_k.device, dtype=chunk_k.dtype)
 
     # ============ 多层共识快速打分 ============
 
@@ -542,7 +542,7 @@ class MemoryBank:
             chunk_k = chunk_k[:, :valid_length]
 
         # Step 1: 加权聚合 Q → [B, H, D]
-        w = entity_weights.to(text_q.device)  # [S]
+        w = entity_weights.to(device=text_q.device, dtype=text_q.dtype)  # [S]
         w = w / (w.sum() + 1e-8)
         q_agg = torch.einsum('bshd,s->bhd', text_q, w)  # [B, H, D]
 
