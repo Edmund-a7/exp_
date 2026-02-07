@@ -326,6 +326,10 @@ class MemoryBank:
                     crossattn_cache[layer_idx],
                     entity_weights
                 )
+                # 归一化：消除各层分数尺度差异，只保留相对排序信息
+                std = layer_scores.std()
+                if std > 1e-8:
+                    layer_scores = (layer_scores - layer_scores.mean()) / std
                 if frame_scores is None:
                     frame_scores = torch.zeros_like(layer_scores)
                 frame_scores = frame_scores + layer_scores * layer_weight
@@ -506,8 +510,10 @@ class MemoryBank:
     # ============ 多层共识快速打分 ============
 
     # 代表层索引和权重: 浅层(纹理) / 中层(结构) / 深层(语义)
+    # layer 0 权重最高：经过验证的 baseline，且浅层 cross-attn K 与视觉 token 的
+    # 对齐最直接；深层过于抽象，帧间区分度低，仅作辅助修正
     CONSENSUS_LAYERS = [0, 15, 29]
-    CONSENSUS_WEIGHTS = [0.2, 0.3, 0.5]
+    CONSENSUS_WEIGHTS = [0.5, 0.3, 0.2]
 
     def _compute_frame_scores_fast(self,
                                     chunk_kv: Dict[str, torch.Tensor],
