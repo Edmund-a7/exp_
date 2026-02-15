@@ -13,6 +13,7 @@ IAM - Intelligent Agent Memory for Video Generation
 
 from .llm_agent import (
     EntityStruct,
+    SceneStruct,
     LLMWrapper,
     EntityStructExtractor,
     GlobalIDManager,
@@ -27,6 +28,7 @@ from .memory_bank import (
 __all__ = [
     # llm_agent
     "EntityStruct",
+    "SceneStruct",
     "LLMWrapper",
     "EntityStructExtractor",
     "GlobalIDManager",

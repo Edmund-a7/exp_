@@ -81,25 +81,34 @@ class MockLLMWrapper:
         return "[]"
 
     def _mock_extraction(self, prompt: str) -> str:
-        """模拟实体提取"""
+        """模拟实体提取 (新格式: entities + scene)"""
         prompt_lower = prompt.lower()
 
         if "young man" in prompt_lower and "another" not in prompt_lower:
-            return json.dumps([
-                {"entity": "young man", "attrs": ["late 20s", "messy black hair", "denim jacket", "holding sketchbook"]}
-            ])
+            return json.dumps({
+                "entities": [
+                    {"entity": "young man", "attrs": ["late 20s", "messy black hair", "denim jacket", "holding sketchbook"]}
+                ],
+                "scene": ["modern city park", "park bench", "daytime"]
+            })
         elif "protagonist" in prompt_lower and "another man" in prompt_lower:
-            return json.dumps([
-                {"entity": "protagonist", "attrs": ["denim jacket", "seated on bench"]},
-                {"entity": "another man", "attrs": ["30 years old", "glasses", "grey sweater", "coffee cup"]}
-            ])
+            return json.dumps({
+                "entities": [
+                    {"entity": "protagonist", "attrs": ["denim jacket", "seated on bench"]},
+                    {"entity": "another man", "attrs": ["30 years old", "glasses", "grey sweater", "coffee cup"]}
+                ],
+                "scene": ["modern city park", "park bench", "daytime"]
+            })
         elif "protagonist" in prompt_lower and "young woman" in prompt_lower:
-            return json.dumps([
-                {"entity": "protagonist", "attrs": ["denim jacket"]},
-                {"entity": "man in grey sweater", "attrs": ["talking on bench"]},
-                {"entity": "young woman", "attrs": ["late 20s", "long hair", "white dress", "shoulder bag"]}
-            ])
-        return "[]"
+            return json.dumps({
+                "entities": [
+                    {"entity": "protagonist", "attrs": ["denim jacket"]},
+                    {"entity": "man in grey sweater", "attrs": ["talking on bench"]},
+                    {"entity": "young woman", "attrs": ["late 20s", "long hair", "white dress", "shoulder bag"]}
+                ],
+                "scene": ["modern city park", "park bench", "daytime"]
+            })
+        return json.dumps({"entities": [], "scene": []})
 
     def _mock_matching(self, prompt: str) -> str:
         """模拟实体匹配"""
@@ -177,36 +186,52 @@ class TestEntityStructExtractor:
         mock_llm = MockLLMWrapper()
         extractor = EntityStructExtractor(llm=mock_llm)
 
-        entities = extractor.extract(TEST_PROMPTS[0])
+        entities, scene_texts = extractor.extract(TEST_PROMPTS[0])
 
         assert len(entities) >= 1
         assert entities[0].entity == "young man"
         assert "late 20s" in entities[0].attrs
         assert entities[0].global_id is None  # 提取时不分配 ID
+        assert len(scene_texts) > 0
+        assert "modern city park" in scene_texts
 
     def test_extract_multiple_entities(self):
         """测试提取多个实体"""
         mock_llm = MockLLMWrapper()
         extractor = EntityStructExtractor(llm=mock_llm)
 
-        entities = extractor.extract(TEST_PROMPTS[1])
+        entities, scene_texts = extractor.extract(TEST_PROMPTS[1])
 
         assert len(entities) >= 2
         entity_names = [e.entity for e in entities]
         assert "protagonist" in entity_names
         assert "another man" in entity_names
+        assert len(scene_texts) > 0
 
     def test_parse_response_with_markdown(self):
         """测试解析带 markdown 格式的响应"""
         extractor = EntityStructExtractor(llm=MockLLMWrapper())
 
+        # 新格式: {"entities": [...], "scene": [...]}
         response = '''```json
-[{"entity": "test", "attrs": ["attr1"]}]
+{"entities": [{"entity": "test", "attrs": ["attr1"]}], "scene": ["park"]}
 ```'''
-        result = extractor._parse_response(response)
+        entities_data, scene_texts = extractor._parse_response(response)
 
-        assert len(result) == 1
-        assert result[0]["entity"] == "test"
+        assert len(entities_data) == 1
+        assert entities_data[0]["entity"] == "test"
+        assert scene_texts == ["park"]
+
+    def test_parse_response_legacy_array(self):
+        """测试兼容旧格式 (纯 JSON 数组)"""
+        extractor = EntityStructExtractor(llm=MockLLMWrapper())
+
+        response = '[{"entity": "test", "attrs": ["attr1"]}]'
+        entities_data, scene_texts = extractor._parse_response(response)
+
+        assert len(entities_data) == 1
+        assert entities_data[0]["entity"] == "test"
+        assert scene_texts == []  # 旧格式无 scene
 
 
 class TestGlobalIDManager:
@@ -282,7 +307,7 @@ class TestLLMAgent:
         agent.extractor = EntityStructExtractor(llm=self.mock_llm)
         agent.id_manager = GlobalIDManager(llm=self.mock_llm)
 
-        entities, registry_update = agent.process_prompt(
+        entities, registry_update, scene_texts = agent.process_prompt(
             prompt=TEST_PROMPTS[0],
             prompt_id=1,
             global_registry={}
@@ -292,6 +317,7 @@ class TestLLMAgent:
         assert entities[0].global_id == 1
         assert "1" in registry_update
         assert registry_update["1"]["action"] == "create"
+        assert isinstance(scene_texts, list)
 
     def test_process_subsequent_prompt(self):
         """测试处理后续 prompt"""
@@ -309,7 +335,7 @@ class TestLLMAgent:
             }
         }
 
-        entities, registry_update = agent.process_prompt(
+        entities, registry_update, scene_texts = agent.process_prompt(
             prompt=TEST_PROMPTS[1],
             prompt_id=2,
             global_registry=global_registry
@@ -490,7 +516,7 @@ class TestIntegration:
 
         # 处理 Prompt 1
         print("\n=== Processing Prompt 1 ===")
-        entities, registry_update = agent.process_prompt(
+        entities, registry_update, _scene = agent.process_prompt(
             prompt=TEST_PROMPTS[0],
             prompt_id=1,
             global_registry=memory_bank.global_registry
@@ -503,7 +529,7 @@ class TestIntegration:
 
         # 处理 Prompt 2
         print("\n=== Processing Prompt 2 ===")
-        entities, registry_update = agent.process_prompt(
+        entities, registry_update, _scene = agent.process_prompt(
             prompt=TEST_PROMPTS[1],
             prompt_id=2,
             global_registry=memory_bank.global_registry
@@ -525,7 +551,7 @@ class TestIntegration:
 
         # 处理 Prompt 3
         print("\n=== Processing Prompt 3 ===")
-        entities, registry_update = agent.process_prompt(
+        entities, registry_update, _scene = agent.process_prompt(
             prompt=TEST_PROMPTS[2],
             prompt_id=3,
             global_registry=memory_bank.global_registry
@@ -568,7 +594,7 @@ class TestIntegration:
 
         # 处理所有 prompts
         for i, prompt in enumerate(TEST_PROMPTS):
-            entities, registry_update = agent.process_prompt(
+            entities, registry_update, _scene = agent.process_prompt(
                 prompt=prompt,
                 prompt_id=i + 1,
                 global_registry=memory_bank.global_registry

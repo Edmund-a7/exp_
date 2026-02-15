@@ -45,6 +45,19 @@ class EntityStruct:
         )
 
 
+@dataclass
+class SceneStruct:
+    """场景文本数据结构 — 无需 ID，纯文本相似度检索"""
+    scene_texts: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict:
+        return {"scene_texts": self.scene_texts}
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "SceneStruct":
+        return cls(scene_texts=data.get("scene_texts", []))
+
+
 class LLMWrapper:
     """LLM封装类，支持 HuggingFace Transformers 和 vLLM 两种后端"""
 
@@ -212,36 +225,45 @@ class LLMWrapper:
 
 class EntityStructExtractor:
     """
-    实体提取器
-    功能: 从prompt文本中提取实体和属性
+    Prompt 提取器
+    功能: 从prompt文本中同时提取实体(entity)和场景(scene)信息
     使用LLM: Qwen 系列或其他兼容模型
+
+    设计原理 (来自 ID-Centric Memory 框架):
+    - Entity 需要 Global ID (存在指代消歧: "young man" / "protagonist" / "he" 可能是同一人)
+    - Scene 不需要 ID (文本相似度天然可用: "snowy forest" 就是 "snowy forest")
     """
 
-    SYSTEM_PROMPT = """Extract human characters from the video prompt.
+    SYSTEM_PROMPT = """Extract human characters AND scene elements from the video prompt.
 
 RULES:
-1. ONLY extract human/person entities (man, woman, protagonist, etc.)
-2. DO NOT extract objects or locations
-3. Extract visual attributes as a string list
-4. Keep entity names short
+1. "entities": ONLY human/person characters (man, woman, protagonist, etc.)
+   - Extract visual attributes as a string list
+   - Keep entity names short
+2. "scene": environment, background, lighting, weather, objects, locations
+   - Each element is a short descriptive phrase
+   - DO NOT include character descriptions in scene
 
-OUTPUT FORMAT (JSON array only, no explanation):
-[{"entity": "<entity_name>", "attrs": ["<attr1>", "<attr2>", ...]}]
+OUTPUT FORMAT (JSON object only, no explanation):
+{"entities": [{"entity": "<name>", "attrs": ["<attr1>", "<attr2>"]}], "scene": ["<element1>", "<element2>"]}
 
-If no humans found, return: []"""
+If no humans found, entities should be [].
+If no scene elements found, scene should be []."""
 
     def __init__(self, llm: Optional[LLMWrapper] = None, model_path: str = "../Qwen3-0.6B"):
         self.llm = llm or LLMWrapper(model_path)
 
-    def extract(self, prompt: str) -> List[EntityStruct]:
+    def extract(self, prompt: str) -> Tuple[List[EntityStruct], List[str]]:
         """
-        从prompt中提取实体和属性
+        从prompt中提取实体和场景信息
 
         Args:
             prompt: 视频生成的文本prompt
 
         Returns:
-            实体列表，global_id均为None
+            (entities, scene_texts)
+            - entities: 实体列表，global_id 均为 None
+            - scene_texts: 场景文本列表
         """
         response = self.llm.generate(
             system_prompt=self.SYSTEM_PROMPT,
@@ -250,8 +272,8 @@ If no humans found, return: []"""
             temperature=0.1
         )
 
-        entities_data = self._parse_response(response)
-        return [
+        entities_data, scene_texts = self._parse_response(response)
+        entities = [
             EntityStruct(
                 entity=e.get("entity", ""),
                 attrs=e.get("attrs", []),
@@ -259,30 +281,73 @@ If no humans found, return: []"""
             )
             for e in entities_data
         ]
+        return entities, scene_texts
 
-    def _parse_response(self, response: str) -> List[Dict]:
-        """解析LLM响应，带容错处理"""
+    def _parse_response(self, response: str) -> Tuple[List[Dict], List[str]]:
+        """解析LLM响应，带容错处理。返回 (entities_data, scene_texts)"""
         try:
             # 移除markdown代码块标记
             response = re.sub(r'```json\s*', '', response)
             response = re.sub(r'```\s*', '', response)
             response = response.strip()
 
-            # 找到JSON数组
-            start = response.find('[')
-            end = response.rfind(']')
-            if start != -1 and end != -1 and end > start:
-                json_str = response[start:end + 1]
+            # 尝试解析为 {"entities": [...], "scene": [...]} 格式
+            obj_start = response.find('{')
+            obj_end = response.rfind('}')
+            if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
+                json_str = response[obj_start:obj_end + 1]
                 try:
-                    return json.loads(json_str)
+                    data = json.loads(json_str)
+                    if isinstance(data, dict) and ("entities" in data or "scene" in data):
+                        entities = data.get("entities", [])
+                        scene = data.get("scene", [])
+                        if isinstance(scene, str):
+                            scene = [scene]
+                        return entities, scene
                 except json.JSONDecodeError:
-                    # 尝试修复常见错误：提取所有 {"entity": ..., "attrs": ...} 模式
-                    return self._extract_entities_fallback(json_str)
-            return json.loads(response)
+                    pass
+
+            # 兼容旧格式: 纯 JSON 数组 [{"entity": ..., "attrs": ...}]
+            arr_start = response.find('[')
+            arr_end = response.rfind(']')
+            if arr_start != -1 and arr_end != -1 and arr_end > arr_start:
+                json_str = response[arr_start:arr_end + 1]
+                try:
+                    arr = json.loads(json_str)
+                    if isinstance(arr, list):
+                        return arr, []
+                except json.JSONDecodeError:
+                    return self._extract_entities_fallback(json_str), []
+
+            parsed = json.loads(response)
+            if isinstance(parsed, list):
+                return parsed, []
+
+            if isinstance(parsed, dict):
+                # 新格式或接近新格式
+                if "entities" in parsed or "scene" in parsed:
+                    entities = parsed.get("entities", [])
+                    scene = parsed.get("scene", [])
+                    if isinstance(scene, str):
+                        scene = [scene]
+                    if not isinstance(entities, list):
+                        entities = []
+                    if not isinstance(scene, list):
+                        scene = []
+                    return entities, scene
+
+                # 单实体对象兼容: {"entity": "...", "attrs": [...]}
+                if "entity" in parsed:
+                    return [{
+                        "entity": parsed.get("entity", ""),
+                        "attrs": parsed.get("attrs", []) if isinstance(parsed.get("attrs", []), list) else []
+                    }], []
+
+            # 兜底：避免把任意对象当实体列表导致后续崩溃
+            return self._extract_entities_fallback(response), self._extract_scene_fallback(response)
         except json.JSONDecodeError:
             print(f"Warning: Failed to parse JSON, raw response: {response[:500]}...")
-            # 最后尝试用正则提取
-            return self._extract_entities_fallback(response)
+            return self._extract_entities_fallback(response), self._extract_scene_fallback(response)
 
     def _extract_entities_fallback(self, text: str) -> List[Dict]:
         """
@@ -326,6 +391,17 @@ If no humans found, return: []"""
                 })
 
         return entities
+
+    def _extract_scene_fallback(self, text: str) -> List[str]:
+        """后备方案：用正则提取 scene 列表"""
+        scene_pattern = r'"scene"\s*:\s*\[([^\]]*)\]'
+        match = re.search(scene_pattern, text)
+        if match:
+            try:
+                return json.loads(f"[{match.group(1)}]")
+            except (json.JSONDecodeError, ValueError):
+                return re.findall(r'"([^"]+)"', match.group(1))
+        return []
 
 
 class GlobalIDManager:
@@ -514,9 +590,9 @@ class LLMAgent:
     def process_prompt(self,
                        prompt: str,
                        prompt_id: int,
-                       global_registry: Dict[str, Dict]) -> Tuple[List[EntityStruct], Dict[str, Any]]:
+                       global_registry: Dict[str, Dict]) -> Tuple[List[EntityStruct], Dict[str, Any], List[str]]:
         """
-        处理prompt，提取实体并分配ID
+        处理prompt，提取实体并分配ID，同时提取场景文本
 
         Args:
             prompt: prompt文本
@@ -524,13 +600,16 @@ class LLMAgent:
             global_registry: 现有的全局注册表
 
         Returns:
-            (entities, registry_update) - 实体列表和需要更新的registry信息
+            (entities, registry_update, scene_texts)
+            - entities: 已分配 ID 的实体列表
+            - registry_update: 需要更新的 registry 信息
+            - scene_texts: 场景文本列表 (无需 ID，用于 Scene Memory 相似度检索)
         """
-        # 1. 提取实体
-        entities = self.extractor.extract(prompt)
+        # 1. 提取实体和场景
+        entities, scene_texts = self.extractor.extract(prompt)
 
         if not entities:
-            return [], {}
+            return [], {}, scene_texts
 
         # 2. 分配ID
         is_first_prompt = (prompt_id == 1)
@@ -539,7 +618,7 @@ class LLMAgent:
         # 3. 构建registry更新
         registry_update = self._build_registry_update(entities, prompt_id, global_registry)
 
-        return entities, registry_update
+        return entities, registry_update, scene_texts
 
     def _build_registry_update(self,
                                entities: List[EntityStruct],
@@ -637,12 +716,15 @@ if __name__ == "__main__":
         print(f"{'='*60}")
         print(prompt)
 
-        entities, registry_update = agent.process_prompt(prompt, prompt_id, global_registry)
+        entities, registry_update, scene_texts = agent.process_prompt(prompt, prompt_id, global_registry)
 
         print(f"\nExtracted entities:")
         for e in entities:
             print(f"  - {e.entity} (ID: {e.global_id})")
             print(f"    Attrs: {e.attrs}")
+
+        print(f"\nExtracted scene:")
+        print(f"  {scene_texts}")
 
         # 应用更新到registry
         for gid, info in registry_update.items():
