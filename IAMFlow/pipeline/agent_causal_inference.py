@@ -28,7 +28,7 @@ from utils.debug_option import DEBUG
 from utils.profiling import compute_pure_diffusion_time
 
 # IAM 模块
-from iam.llm_agent import LLMAgent, EntityStruct
+from iam.llm_agent import LLMAgent, EntityStruct, SceneStruct
 from iam.memory_bank import MemoryBank
 
 
@@ -94,6 +94,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         self.current_chunk_id = 0
         self.current_entities: List[EntityStruct] = []
         self.current_prompt_text: str = ""  # 当前 prompt 文本，用于精确定位实体位置
+        self.current_scene_texts: List[str] = []  # 当前 prompt 的场景文本 (Phase 2 双层记忆使用)
 
         # P0 优化: 缓存 IAM bank 长度，避免在 forward 中调用 .item()
         self._iam_bank_length = 0
@@ -396,7 +397,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             # ===== 5. IAM 帧选择和 bank 更新 (chunk >= 3 时) =====
             # 关键：必须在 clean context 更新前获取被驱逐的 chunk
             self.current_chunk_id += 1
-            if self.current_chunk_id >= 3 and self.current_entities:
+            if self.current_chunk_id >= 3 and (self.current_entities or self.current_scene_texts):
                 if profile:
                     memory_start.record()
 
@@ -589,6 +590,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         self.current_chunk_id = 0
         self.current_entities = []
         self.current_prompt_text = ""
+        self.current_scene_texts = []
         self.agent_memory_bank.clear()
         self._iam_bank_length = 0
         # 重置 LLM Agent 的 ID 计数器，确保每次推理 global_registry 从 1 开始
@@ -618,18 +620,20 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         print(f"[DEBUG] is_first_prompt: {is_first_prompt}")
         print(f"{'='*60}")
 
-        # 1. LLM Agent 提取实体并分配 ID
-        entities, registry_update = self.llm_agent.process_prompt(
+        # 1. LLM Agent 提取实体并分配 ID，同时提取场景文本
+        entities, registry_update, scene_texts = self.llm_agent.process_prompt(
             prompt=prompt_text,
             prompt_id=prompt_id,
             global_registry=self.agent_memory_bank.global_registry
         )
 
         self.current_entities = entities
+        self.current_scene_texts = scene_texts
 
         print(f"[DEBUG] Extracted {len(entities)} entities:")
         for e in entities:
             print(f"  - entity='{e.entity}', global_id={e.global_id}, attrs={e.attrs}")
+        print(f"[DEBUG] Extracted scene: {scene_texts}")
 
         print(f"[DEBUG] Registry update: {list(registry_update.keys()) if registry_update else 'None'}")
 
@@ -643,12 +647,15 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
 
         print(f"[DEBUG] Global registry after update: {list(self.agent_memory_bank.global_registry.keys())}")
 
-        # 3. 检索初始记忆帧 (非首个 prompt)
-        if not is_first_prompt and entities:
-            entity_ids = self.agent_memory_bank.get_entity_ids(entities)
-            print(f"[DEBUG] Retrieving initial frames for entity_ids: {entity_ids}")
-            retrieved_frames = self.agent_memory_bank.retrieve_initial_frames(entity_ids)
+        # 3. 检索初始记忆帧 (非首个 prompt) — 双路检索
+        if not is_first_prompt and (entities or scene_texts):
+            entity_ids = self.agent_memory_bank.get_entity_ids(entities) if entities else []
+            print(f"[DEBUG] Retrieving initial frames for entity_ids: {entity_ids}, scene_texts: {scene_texts}")
+            retrieved_frames = self.agent_memory_bank.retrieve_initial_frames(
+                entity_ids, scene_texts=scene_texts
+            )
             print(f"[DEBUG] Retrieved initial frames: {retrieved_frames}")
+            print(f"[DEBUG] id_memory={self.agent_memory_bank.id_memory}, scene_memory={self.agent_memory_bank.scene_memory}")
 
             if DEBUG:
                 print(f"[AgentPipeline] Retrieved initial frames: {retrieved_frames}")
@@ -667,7 +674,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             current_start_frame: 当前起始帧
             current_num_frames: 当前块帧数
         """
-        if not self.current_entities:
+        if not self.current_entities and not self.current_scene_texts:
             return
 
         # 获取被驱逐的 chunk 的 KV (从 kv_cache 中，所有 30 个 block)
@@ -680,7 +687,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         print(f"[DEBUG] current_start_frame={current_start_frame}, current_num_frames={current_num_frames}")
         print(f"[DEBUG] evicted_chunk_kv shape: k={evicted_chunk_kv[0]['k'].shape}")
 
-        # IAM 帧选择 (使用 entity-attr 字符串 + prompt 精确定位)
+        # IAM 双路帧选择
         entity_ids = self.agent_memory_bank.get_entity_ids(self.current_entities)
         frame_id, score = self.agent_memory_bank.select_frame_from_chunk(
             evicted_chunk_kv=evicted_chunk_kv,
@@ -689,15 +696,20 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             chunk_id=self.current_chunk_id,
             current_entity_ids=entity_ids,
             current_entities=self.current_entities,
-            prompt_text=self.current_prompt_text  # 传入 prompt 文本用于精确定位
+            prompt_text=self.current_prompt_text,
+            scene_texts=self.current_scene_texts,
         )
 
         print(f"[DEBUG] IAM selected frame: {frame_id}, score={score:.4f}")
 
-        # 更新 active memory
-        self.agent_memory_bank.update_active_memory(frame_id, score)
+        # 双路更新: 分别更新 id_memory 和 scene_memory
+        frame_info = self.agent_memory_bank.frame_archive[frame_id]
+        self.agent_memory_bank.update_id_memory(frame_id, frame_info.entity_score)
+        self.agent_memory_bank.update_scene_memory(frame_id, frame_info.scene_score)
 
-        print(f"[DEBUG] Active memory after update: {self.agent_memory_bank.frame_active_memory}")
+        print(f"[DEBUG] id_memory={self.agent_memory_bank.id_memory}")
+        print(f"[DEBUG] scene_memory={self.agent_memory_bank.scene_memory}")
+        print(f"[DEBUG] Active memory (combined): {self.agent_memory_bank.frame_active_memory}")
         print(f"[DEBUG] Frame archive size: {len(self.agent_memory_bank.frame_archive)}")
 
         if DEBUG:
@@ -817,6 +829,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             "current_prompt_id": self.current_prompt_id,
             "current_chunk_id": self.current_chunk_id,
             "current_entities": [e.to_dict() for e in self.current_entities],
+            "current_scene_texts": self.current_scene_texts,
             "global_registry": self.agent_memory_bank.global_registry,
             "frame_archive_count": len(self.agent_memory_bank.frame_archive),
             "active_memory": self.agent_memory_bank.frame_active_memory

@@ -32,7 +32,10 @@ class FrameInfo:
     frame_path: str
     prompt_id: int
     associated_entities: List[str]  # global_id列表
-    score: float
+    score: float                    # 综合分数 (向后兼容)
+    entity_score: float = 0.0      # entity 维度分数
+    scene_score: float = 0.0       # scene 维度分数
+    scene_texts: List[str] = field(default_factory=list)  # 该帧对应 prompt 的场景文本
     # 存储所有 transformer block 的 KV cache
     # List[Dict[str, torch.Tensor]] - 每个 block 一个 {"k": ..., "v": ...}
     kv_cache: Optional[List[Dict[str, torch.Tensor]]] = None
@@ -42,7 +45,10 @@ class FrameInfo:
             "frame_path": self.frame_path,
             "prompt_id": self.prompt_id,
             "associated_entities": self.associated_entities,
-            "score": self.score
+            "score": self.score,
+            "entity_score": self.entity_score,
+            "scene_score": self.scene_score,
+            "scene_texts": self.scene_texts,
         }
 
 
@@ -53,13 +59,15 @@ class MemoryBank:
     职责:
     1. 维护 global_registry (实体注册表)
     2. 维护 frame_archive (帧存档)
-    3. 维护 frame_active_memory (当前3帧记忆)
+    3. 维护双层 active memory: id_memory (管"谁") + scene_memory (管"在哪")
     4. 帧选择和驱逐
     """
 
     def __init__(self,
                  text_encoder=None,
                  max_memory_frames: int = 3,
+                 max_id_memory_frames: int = 4,
+                 max_scene_memory_frames: int = 2,
                  frame_seq_length: int = 1560,
                  num_transformer_blocks: int = 30,
                  save_dir: str = "data",
@@ -69,7 +77,9 @@ class MemoryBank:
 
         Args:
             text_encoder: WanTextEncoder实例，用于文本编码 (现在不直接使用，改用 crossattn_cache)
-            max_memory_frames: 最大记忆帧数量
+            max_memory_frames: 最大记忆帧数量 (向后兼容，仅在未启用双层记忆时使用)
+            max_id_memory_frames: ID Memory 最大帧数 (entity 驱动，1~4 帧)
+            max_scene_memory_frames: Scene Memory 最大帧数 (scene 驱动，1~2 帧)
             frame_seq_length: 每帧的序列长度
             num_transformer_blocks: transformer block 数量 (默认30)
             save_dir: 帧数据保存目录
@@ -77,6 +87,8 @@ class MemoryBank:
         """
         self.text_encoder = text_encoder
         self.max_memory_frames = max_memory_frames
+        self.max_id_memory_frames = max_id_memory_frames
+        self.max_scene_memory_frames = max_scene_memory_frames
         self.frame_seq_length = frame_seq_length
         self.num_transformer_blocks = num_transformer_blocks
         self.save_dir = save_dir
@@ -85,13 +97,27 @@ class MemoryBank:
         # 核心数据结构
         self.global_registry: Dict[str, Dict] = {}
         self.frame_archive: Dict[str, FrameInfo] = {}
-        self.frame_active_memory: List[str] = []  # frame_id列表
+
+        # 双层 active memory (Phase 2)
+        self.id_memory: List[str] = []       # entity 驱动，按 entity_score top-k
+        self.scene_memory: List[str] = []    # scene 驱动，按 scene_score top-k
 
         # KV cache存储 (内存中) - 每个 frame_id 对应 30 个 block 的 KV
         self._frame_kv_store: Dict[str, List[Dict[str, torch.Tensor]]] = {}
 
         # 确保保存目录存在
         os.makedirs(save_dir, exist_ok=True)
+
+    @property
+    def frame_active_memory(self) -> List[str]:
+        """向后兼容属性: 返回 id_memory + scene_memory 的去重合并"""
+        return list(dict.fromkeys(self.id_memory + self.scene_memory))
+
+    @frame_active_memory.setter
+    def frame_active_memory(self, value: List[str]):
+        """向后兼容 setter: 直接赋值时写入 id_memory，清空 scene_memory"""
+        self.id_memory = list(value)
+        self.scene_memory = []
 
     # ============ 实体注册相关 ============
 
@@ -178,60 +204,66 @@ class MemoryBank:
 
     # ============ 帧检索相关 ============
 
-    def retrieve_initial_frames(self, entity_ids: List[int]) -> List[str]:
+    def retrieve_initial_frames(self, entity_ids: List[int],
+                                scene_texts: Optional[List[str]] = None) -> List[str]:
         """
-        根据entity_ids从frame_archive检索初始记忆帧
+        双路检索: 分别填充 id_memory 和 scene_memory
 
-        策略:
-        1. 优先选择包含更多匹配entity的帧
-        2. 按score排序取top-k
+        ID Memory: 按 entity_id 匹配 + entity_score 排序
+        Scene Memory: 按 scene_score 排序 (如果有 scene_texts)
 
         Args:
             entity_ids: 当前prompt的实体ID列表
+            scene_texts: 当前prompt的场景文本列表
 
         Returns:
-            检索到的frame_id列表
+            去重合并后的 frame_id 列表 (= frame_active_memory property)
         """
-        print(f"[DEBUG] retrieve_initial_frames: entity_ids={entity_ids}, archive_size={len(self.frame_archive)}")
+        print(f"[DEBUG] retrieve_initial_frames: entity_ids={entity_ids}, scene_texts={scene_texts}, archive_size={len(self.frame_archive)}")
 
         if not self.frame_archive:
             print(f"[DEBUG] retrieve_initial_frames: No frames in archive")
             return []
 
+        # === ID Memory 路径: 按 entity 匹配 + entity_score ===
         entity_id_strs = [str(eid) for eid in entity_ids]
+        id_candidates = []
+        if entity_id_strs:
+            for frame_id, frame_info in self.frame_archive.items():
+                intersection = set(frame_info.associated_entities) & set(entity_id_strs)
+                match_count = len(intersection)
+                if match_count > 0:
+                    combined = match_count * 10 + frame_info.entity_score
+                    id_candidates.append((frame_id, combined))
 
-        # 计算每帧与当前entities的匹配度
-        frame_scores = []
-        for frame_id, frame_info in self.frame_archive.items():
-            # 计算交集数量
-            intersection = set(frame_info.associated_entities) & set(entity_id_strs)
-            match_count = len(intersection)
+            if not id_candidates:
+                # 有实体 ID 但无匹配，按 entity_score 取 top-k 作为兜底
+                id_candidates = [(fid, fi.entity_score) for fid, fi in self.frame_archive.items()]
 
-            if match_count > 0:
-                # 综合考虑匹配数量和原始分数
-                combined_score = match_count * 10 + frame_info.score
-                frame_scores.append((frame_id, combined_score, frame_info.score, match_count))
-
-        print(f"[DEBUG] retrieve_initial_frames: {len(frame_scores)} frames matched entities")
-
-        if not frame_scores:
-            # 没有匹配的帧，返回分数最高的帧
-            all_frames = [(fid, fi.score) for fid, fi in self.frame_archive.items()]
-            all_frames.sort(key=lambda x: x[1], reverse=True)
-            selected = [f[0] for f in all_frames[:self.max_memory_frames]]
-            print(f"[DEBUG] retrieve_initial_frames: No entity match, using top-score frames: {selected}")
+            id_candidates.sort(key=lambda x: x[1], reverse=True)
+            self.id_memory = [f[0] for f in id_candidates[:self.max_id_memory_frames]]
         else:
-            # 按综合分数排序
-            frame_scores.sort(key=lambda x: x[1], reverse=True)
-            selected = [f[0] for f in frame_scores[:self.max_memory_frames]]
-            print(f"[DEBUG] retrieve_initial_frames: Selected by entity match:")
-            for fid, combined, orig, match in frame_scores[:self.max_memory_frames]:
-                print(f"  - {fid}: match_count={match}, combined_score={combined:.4f}, orig_score={orig:.4f}")
+            # 无实体时不填充 ID Memory，保持双路径独立
+            self.id_memory = []
+        print(f"[DEBUG] retrieve_initial_frames: id_memory={self.id_memory}")
 
-        # 更新active memory
-        self.frame_active_memory = selected.copy()
+        # === Scene Memory 路径: 按 scene_score ===
+        if scene_texts:
+            scene_candidates = []
+            for fid, fi in self.frame_archive.items():
+                relevance = self._compute_scene_relevance(fi, scene_texts)
+                scene_candidates.append((fid, relevance, fi.scene_score))
 
-        return selected
+            # 先按当前 scene query 的匹配度排序，再用历史 scene_score 打破平局
+            scene_candidates.sort(key=lambda x: (x[1], x[2]), reverse=True)
+            self.scene_memory = [f[0] for f in scene_candidates[:self.max_scene_memory_frames]]
+            print(f"[DEBUG] retrieve_initial_frames: scene_memory={self.scene_memory}")
+        else:
+            self.scene_memory = []
+
+        result = self.frame_active_memory  # property: 去重合并
+        print(f"[DEBUG] retrieve_initial_frames: combined={result}")
+        return result
 
     # ============ 帧选择相关 ============
 
@@ -242,27 +274,25 @@ class MemoryBank:
                                 chunk_id: int,
                                 current_entity_ids: List[int],
                                 current_entities: Optional[List['EntityStruct']] = None,
-                                prompt_text: Optional[str] = None) -> Tuple[str, float]:
+                                prompt_text: Optional[str] = None,
+                                scene_texts: Optional[List[str]] = None) -> Tuple[str, float]:
         """
-        从驱逐的chunk中选择最佳帧
+        从驱逐的chunk中选择最佳帧 (双路打分)
 
-        方案 A: 使用 crossattn_cache 计算注意力分数，但通过实体信息加权
-        - 保持原始特征空间对齐
-        - 根据 entity/attrs 在 prompt 中的位置精确加权
+        同时计算 entity_score 和 scene_score，综合分数 = 0.6*entity + 0.4*scene
 
         Args:
             evicted_chunk_kv: 驱逐chunk的KV cache (所有30个block)
-                              List[{"k": [B, L, H, D], "v": [B, L, H, D]}]
             crossattn_cache: cross-attention cache (所有30个block)
-                             List[{"k": [B, 512, H, D], "v": [B, 512, H, D], "is_init": bool}]
             prompt_id: 当前prompt序号
             chunk_id: 当前chunk序号
             current_entity_ids: 当前prompt的实体ID列表
-            current_entities: 当前prompt的实体列表 (用于构建实体权重)
-            prompt_text: 当前 prompt 文本 (用于精确定位实体位置)
+            current_entities: 当前prompt的实体列表
+            prompt_text: 当前 prompt 文本
+            scene_texts: 当前 prompt 的场景文本列表
 
         Returns:
-            (frame_id, score) - 选中的帧ID和分数
+            (frame_id, score) - 选中的帧ID和综合分数
         """
         if not evicted_chunk_kv or not crossattn_cache:
             raise ValueError("evicted_chunk_kv and crossattn_cache must not be empty")
@@ -274,79 +304,51 @@ class MemoryBank:
             for layer_idx in range(available_layers)
         )
 
-        # 检查 crossattn_cache 是否已初始化
+        device = evicted_chunk_kv[0]["k"].device
+        dtype = evicted_chunk_kv[0]["k"].dtype
+
         if not has_initialized_layer:
             import warnings
             warnings.warn("[MemoryBank] crossattn_cache not initialized, selecting first frame by default")
-            frame_scores = torch.ones(
-                num_candidate_frames,
-                device=evicted_chunk_kv[0]["k"].device,
-                dtype=evicted_chunk_kv[0]["k"].dtype
-            )
+            entity_scores = torch.ones(num_candidate_frames, device=device, dtype=dtype)
+            scene_scores = torch.ones(num_candidate_frames, device=device, dtype=dtype)
         else:
-            # 多层共识打分: 用 3 个代表层投票，比单层更准确
             num_text_tokens = crossattn_cache[0]["k"].shape[1]
+
+            # 1. Entity 路径: entity+attrs token 权重打分
             entity_weights = self._build_entity_token_weights(
                 current_entities, num_text_tokens, prompt_text
             )
+            entity_scores = self._consensus_score(
+                evicted_chunk_kv, crossattn_cache, entity_weights,
+                available_layers, num_candidate_frames
+            )
 
-            if current_entities and len(current_entities) > 0:
-                entity_query = self.build_entity_attrs_query(current_entities)
-                print(f"[DEBUG] Entity-focus mode: '{entity_query[:50]}...' (multi-layer consensus)")
-            else:
-                print(f"[DEBUG] No entities, using uniform weights (multi-layer consensus)")
-
-            frame_scores = None
-            valid_layers = []
-            valid_weights = []
-            for layer_idx, layer_weight in zip(self.CONSENSUS_LAYERS, self.CONSENSUS_WEIGHTS):
-                if layer_idx < available_layers and crossattn_cache[layer_idx].get("is_init", False):
-                    valid_layers.append(layer_idx)
-                    valid_weights.append(layer_weight)
-
-            # 边界兜底：如果代表层不可用，退回到 layer 0
-            if not valid_layers:
-                fallback_layer = 0
-                for layer_idx in range(available_layers):
-                    if crossattn_cache[layer_idx].get("is_init", False):
-                        fallback_layer = layer_idx
-                        break
-                valid_layers = [fallback_layer]
-                valid_weights = [1.0]
-
-            weight_sum = sum(valid_weights)
-            if weight_sum <= 0:
-                valid_weights = [1.0 / len(valid_weights)] * len(valid_weights)
-            else:
-                valid_weights = [w / weight_sum for w in valid_weights]
-
-            for layer_idx, layer_weight in zip(valid_layers, valid_weights):
-                layer_scores = self._compute_frame_scores_fast(
-                    evicted_chunk_kv[layer_idx],
-                    crossattn_cache[layer_idx],
-                    entity_weights
+            # 2. Scene 路径: scene text token 权重打分
+            if scene_texts:
+                scene_weights = self._build_scene_token_weights(
+                    scene_texts, num_text_tokens, prompt_text, current_entities
                 )
-                # 归一化：消除各层分数尺度差异，只保留相对排序信息
-                std = layer_scores.std()
-                if std > 1e-8:
-                    layer_scores = (layer_scores - layer_scores.mean()) / std
-                if frame_scores is None:
-                    frame_scores = torch.zeros_like(layer_scores)
-                frame_scores = frame_scores + layer_scores * layer_weight
-
-            if frame_scores is None:
-                frame_scores = torch.ones(
-                    num_candidate_frames,
-                    device=evicted_chunk_kv[0]["k"].device,
-                    dtype=evicted_chunk_kv[0]["k"].dtype
+                scene_scores = self._consensus_score(
+                    evicted_chunk_kv, crossattn_cache, scene_weights,
+                    available_layers, num_candidate_frames
                 )
+            else:
+                scene_scores = torch.zeros(num_candidate_frames, device=device, dtype=dtype)
+
+        # 3. 综合分数
+        combined_scores = 0.6 * entity_scores + 0.4 * scene_scores
 
         # 选择最高分帧
-        best_frame_idx = frame_scores.argmax().item()
-        best_score = frame_scores[best_frame_idx].item()
+        best_frame_idx = combined_scores.argmax().item()
+        best_score = combined_scores[best_frame_idx].item()
+        best_entity_score = entity_scores[best_frame_idx].item()
+        best_scene_score = scene_scores[best_frame_idx].item()
 
-        print(f"[DEBUG] select_frame_from_chunk: frame_scores={frame_scores.tolist()}")
-        print(f"[DEBUG] select_frame_from_chunk: best_frame_idx={best_frame_idx}, best_score={best_score:.4f}")
+        print(f"[DEBUG] select_frame_from_chunk: entity_scores={entity_scores.tolist()}")
+        print(f"[DEBUG] select_frame_from_chunk: scene_scores={scene_scores.tolist()}")
+        print(f"[DEBUG] select_frame_from_chunk: combined={combined_scores.tolist()}")
+        print(f"[DEBUG] select_frame_from_chunk: best_frame_idx={best_frame_idx}, score={best_score:.4f} (entity={best_entity_score:.4f}, scene={best_scene_score:.4f})")
 
         # 生成frame_id
         frame_id = f"p{prompt_id}_c{chunk_id}_f{best_frame_idx}"
@@ -354,13 +356,16 @@ class MemoryBank:
         # 提取该帧的KV cache (所有30个block)
         frame_kv = self._extract_frame_kv_all_blocks(evicted_chunk_kv, best_frame_idx)
 
-        # 保存帧信息
+        # 保存帧信息 (含双分数)
         frame_info = FrameInfo(
             frame_id=frame_id,
             frame_path=os.path.join(self.save_dir, f"{frame_id}.pt"),
             prompt_id=prompt_id,
             associated_entities=[str(eid) for eid in current_entity_ids],
             score=best_score,
+            entity_score=best_entity_score,
+            scene_score=best_scene_score,
+            scene_texts=(scene_texts or []).copy(),
             kv_cache=frame_kv
         )
 
@@ -371,6 +376,69 @@ class MemoryBank:
         self._save_frame_kv(frame_id, frame_kv)
 
         return frame_id, best_score
+
+    def _consensus_score(self,
+                         evicted_chunk_kv: List[Dict[str, torch.Tensor]],
+                         crossattn_cache: List[Dict[str, torch.Tensor]],
+                         token_weights: torch.Tensor,
+                         available_layers: int,
+                         num_candidate_frames: int) -> torch.Tensor:
+        """
+        多层共识打分通用方法: 用 3 个代表层投票
+
+        Args:
+            evicted_chunk_kv: 驱逐chunk的KV cache
+            crossattn_cache: cross-attention cache
+            token_weights: token 权重向量 [S]
+            available_layers: 可用层数
+            num_candidate_frames: 候选帧数
+
+        Returns:
+            [num_frames] 每帧分数
+        """
+        device = evicted_chunk_kv[0]["k"].device
+        dtype = evicted_chunk_kv[0]["k"].dtype
+
+        valid_layers = []
+        valid_weights = []
+        for layer_idx, layer_weight in zip(self.CONSENSUS_LAYERS, self.CONSENSUS_WEIGHTS):
+            if layer_idx < available_layers and crossattn_cache[layer_idx].get("is_init", False):
+                valid_layers.append(layer_idx)
+                valid_weights.append(layer_weight)
+
+        if not valid_layers:
+            fallback_layer = 0
+            for layer_idx in range(available_layers):
+                if crossattn_cache[layer_idx].get("is_init", False):
+                    fallback_layer = layer_idx
+                    break
+            valid_layers = [fallback_layer]
+            valid_weights = [1.0]
+
+        weight_sum = sum(valid_weights)
+        if weight_sum <= 0:
+            valid_weights = [1.0 / len(valid_weights)] * len(valid_weights)
+        else:
+            valid_weights = [w / weight_sum for w in valid_weights]
+
+        frame_scores = None
+        for layer_idx, layer_weight in zip(valid_layers, valid_weights):
+            layer_scores = self._compute_frame_scores_fast(
+                evicted_chunk_kv[layer_idx],
+                crossattn_cache[layer_idx],
+                token_weights
+            )
+            std = layer_scores.std()
+            if std > 1e-8:
+                layer_scores = (layer_scores - layer_scores.mean()) / std
+            if frame_scores is None:
+                frame_scores = torch.zeros_like(layer_scores)
+            frame_scores = frame_scores + layer_scores * layer_weight
+
+        if frame_scores is None:
+            frame_scores = torch.ones(num_candidate_frames, device=device, dtype=dtype)
+
+        return frame_scores
 
     def _compute_frame_scores_with_crossattn(self,
                                               chunk_kv: Dict[str, torch.Tensor],
@@ -658,6 +726,94 @@ class MemoryBank:
 
         return weights
 
+    def _build_scene_token_weights(self,
+                                    scene_texts: Optional[List[str]],
+                                    num_tokens: int,
+                                    prompt_text: Optional[str] = None,
+                                    entities: Optional[List['EntityStruct']] = None) -> torch.Tensor:
+        """
+        构建 scene token 权重向量 — 与 _build_entity_token_weights 互补
+
+        策略:
+        - scene 关键词区域权重高 (2.5x)
+        - entity/attrs 区域权重低 (0.5x)
+        - 无 scene 信息时返回均匀权重
+
+        Args:
+            scene_texts: 场景文本列表 (如 ["snowy forest", "overcast daylight"])
+            num_tokens: token 总数 (通常为 512)
+            prompt_text: 原始 prompt 文本 (用于精确定位)
+            entities: 实体列表 (用于降权 entity 区域)
+
+        Returns:
+            权重向量 [num_tokens]
+        """
+        weights = torch.ones(num_tokens)
+
+        if not scene_texts:
+            return weights
+
+        if prompt_text is None or len(prompt_text) == 0:
+            # 无 prompt 文本，使用开头区域加权 (场景描述通常在 prompt 开头)
+            scene_end = int(num_tokens * 0.30)
+            weights[:scene_end] = 2.0
+            return weights
+
+        prompt_lower = prompt_text.lower()
+        prompt_len = len(prompt_text)
+
+        # Step 1: 定位 scene 关键词并加权
+        scene_weight = 2.5
+        scene_positions = []
+
+        for scene_text in scene_texts:
+            scene_lower = scene_text.lower()
+            pos = prompt_lower.find(scene_lower)
+            if pos != -1:
+                start_ratio = pos / prompt_len
+                end_ratio = (pos + len(scene_lower)) / prompt_len
+                scene_positions.append((start_ratio, end_ratio))
+
+        for start_ratio, end_ratio in scene_positions:
+            start_token = max(0, int((start_ratio - 0.02) * num_tokens))
+            end_token = min(num_tokens, int((end_ratio + 0.02) * num_tokens))
+            for i in range(start_token, end_token):
+                weights[i] = max(weights[i].item(), scene_weight)
+
+        # Step 2: 降权 entity/attrs 区域
+        if entities:
+            entity_suppress = 0.5
+            for entity in entities:
+                entity_lower = entity.entity.lower()
+                pos = prompt_lower.find(entity_lower)
+                if pos != -1:
+                    start_ratio = pos / prompt_len
+                    end_ratio = (pos + len(entity_lower)) / prompt_len
+                    start_token = max(0, int((start_ratio - 0.02) * num_tokens))
+                    end_token = min(num_tokens, int((end_ratio + 0.02) * num_tokens))
+                    for i in range(start_token, end_token):
+                        if weights[i] <= 1.0:  # 不覆盖已标记为 scene 的区域
+                            weights[i] = entity_suppress
+
+                for attr in entity.attrs:
+                    attr_lower = attr.lower()
+                    pos = prompt_lower.find(attr_lower)
+                    if pos != -1:
+                        start_ratio = pos / prompt_len
+                        end_ratio = (pos + len(attr_lower)) / prompt_len
+                        start_token = max(0, int((start_ratio - 0.02) * num_tokens))
+                        end_token = min(num_tokens, int((end_ratio + 0.02) * num_tokens))
+                        for i in range(start_token, end_token):
+                            if weights[i] <= 1.0:
+                                weights[i] = entity_suppress
+
+        if scene_positions:
+            print(f"[DEBUG] Scene keyword positions: {len(scene_positions)} keywords found")
+        else:
+            print(f"[DEBUG] No scene keywords found in prompt, using uniform weights")
+
+        return weights
+
     def _extract_frame_kv_all_blocks(self,
                                       all_blocks_kv: List[Dict[str, torch.Tensor]],
                                       frame_idx: int) -> List[Dict[str, torch.Tensor]]:
@@ -682,6 +838,40 @@ class MemoryBank:
             })
 
         return frame_kv_all_blocks
+
+    @staticmethod
+    def _normalize_scene_texts(scene_texts: Optional[List[str]]) -> Tuple[set, set]:
+        """将 scene 文本归一化为短语集合和 token 集合。"""
+        if not scene_texts:
+            return set(), set()
+
+        phrases = set()
+        tokens = set()
+        for text in scene_texts:
+            if not isinstance(text, str):
+                continue
+            norm = text.strip().lower()
+            if not norm:
+                continue
+            phrases.add(norm)
+            tokens.update(re.findall(r"[a-z0-9]+", norm))
+        return phrases, tokens
+
+    def _compute_scene_relevance(self, frame_info: FrameInfo, query_scene_texts: List[str]) -> float:
+        """计算 frame 与当前 scene query 的相关度。"""
+        query_phrases, query_tokens = self._normalize_scene_texts(query_scene_texts)
+        if not query_phrases and not query_tokens:
+            return frame_info.scene_score
+
+        frame_phrases, frame_tokens = self._normalize_scene_texts(frame_info.scene_texts)
+        if not frame_phrases and not frame_tokens:
+            return frame_info.scene_score
+
+        phrase_overlap = len(query_phrases & frame_phrases) / max(1, len(query_phrases))
+        token_overlap = len(query_tokens & frame_tokens) / max(1, len(query_tokens))
+
+        # 当前 query 匹配度为主，历史 scene_score 作为轻量先验
+        return 0.7 * phrase_overlap + 0.2 * token_overlap + 0.1 * max(0.0, frame_info.scene_score)
 
     def _save_frame_kv(self, frame_id: str, frame_kv: List[Dict[str, torch.Tensor]]) -> None:
         """保存帧KV到文件 (所有 block)"""
@@ -744,6 +934,76 @@ class MemoryBank:
                 print(f"[DEBUG] update_active_memory: Replaced {min_fid}(score={min_score:.4f}) with {frame_id}(score={score:.4f})")
             else:
                 print(f"[DEBUG] update_active_memory: Kept existing frames, new score {score:.4f} <= min_score {min_score:.4f}")
+
+    def update_id_memory(self, frame_id: str, entity_score: float) -> None:
+        """
+        按 entity_score top-k 更新 ID Memory 槽
+
+        Args:
+            frame_id: 新帧ID
+            entity_score: entity 维度分数
+        """
+        if frame_id not in self.frame_archive:
+            return
+
+        if len(self.id_memory) < self.max_id_memory_frames:
+            if frame_id not in self.id_memory:
+                self.id_memory.append(frame_id)
+                print(f"[DEBUG] update_id_memory: Added {frame_id} (entity_score={entity_score:.4f})")
+        else:
+            # 找到 id_memory 中 entity_score 最低的帧
+            min_score = float('inf')
+            min_idx = -1
+            min_fid = None
+
+            for idx, fid in enumerate(self.id_memory):
+                if fid in self.frame_archive:
+                    finfo = self.frame_archive[fid]
+                    if finfo.entity_score < min_score:
+                        min_score = finfo.entity_score
+                        min_idx = idx
+                        min_fid = fid
+
+            if entity_score > min_score and min_idx >= 0:
+                self.id_memory[min_idx] = frame_id
+                print(f"[DEBUG] update_id_memory: Replaced {min_fid}(score={min_score:.4f}) with {frame_id}(score={entity_score:.4f})")
+            else:
+                print(f"[DEBUG] update_id_memory: Kept existing, new {entity_score:.4f} <= min {min_score:.4f}")
+
+    def update_scene_memory(self, frame_id: str, scene_score: float) -> None:
+        """
+        按 scene_score top-k 更新 Scene Memory 槽
+
+        Args:
+            frame_id: 新帧ID
+            scene_score: scene 维度分数
+        """
+        if frame_id not in self.frame_archive:
+            return
+
+        if len(self.scene_memory) < self.max_scene_memory_frames:
+            if frame_id not in self.scene_memory:
+                self.scene_memory.append(frame_id)
+                print(f"[DEBUG] update_scene_memory: Added {frame_id} (scene_score={scene_score:.4f})")
+        else:
+            # 找到 scene_memory 中 scene_score 最低的帧
+            min_score = float('inf')
+            min_idx = -1
+            min_fid = None
+
+            for idx, fid in enumerate(self.scene_memory):
+                if fid in self.frame_archive:
+                    finfo = self.frame_archive[fid]
+                    if finfo.scene_score < min_score:
+                        min_score = finfo.scene_score
+                        min_idx = idx
+                        min_fid = fid
+
+            if scene_score > min_score and min_idx >= 0:
+                self.scene_memory[min_idx] = frame_id
+                print(f"[DEBUG] update_scene_memory: Replaced {min_fid}(score={min_score:.4f}) with {frame_id}(score={scene_score:.4f})")
+            else:
+                print(f"[DEBUG] update_scene_memory: Kept existing, new {scene_score:.4f} <= min {min_score:.4f}")
 
     def get_memory_kv(self, device: torch.device = None) -> Optional[List[Dict[str, torch.Tensor]]]:
         """
@@ -820,7 +1080,9 @@ class MemoryBank:
                 fid: finfo.to_dict()
                 for fid, finfo in self.frame_archive.items()
             },
-            "frame_active_memory": self.frame_active_memory
+            "frame_active_memory": self.frame_active_memory,
+            "id_memory": self.id_memory,
+            "scene_memory": self.scene_memory,
         }
 
         with open(path, 'w', encoding='utf-8') as f:
@@ -840,7 +1102,14 @@ class MemoryBank:
             data = json.load(f)
 
         self.global_registry = data.get("global_registry", {})
-        self.frame_active_memory = data.get("frame_active_memory", [])
+        # 加载双层记忆 (向后兼容: 旧 JSON 只有 frame_active_memory)
+        if "id_memory" in data:
+            self.id_memory = data["id_memory"]
+            self.scene_memory = data.get("scene_memory", [])
+        else:
+            # 旧格式兼容: frame_active_memory → id_memory
+            self.id_memory = data.get("frame_active_memory", [])
+            self.scene_memory = []
 
         # 加载frame_archive
         self.frame_archive = {}
@@ -850,14 +1119,18 @@ class MemoryBank:
                 frame_path=finfo_dict.get("frame_path", ""),
                 prompt_id=finfo_dict.get("prompt_id", 0),
                 associated_entities=finfo_dict.get("associated_entities", []),
-                score=finfo_dict.get("score", 0.0)
+                score=finfo_dict.get("score", 0.0),
+                entity_score=finfo_dict.get("entity_score", 0.0),
+                scene_score=finfo_dict.get("scene_score", 0.0),
+                scene_texts=finfo_dict.get("scene_texts", []),
             )
 
     def clear(self) -> None:
         """清空Memory Bank"""
         self.global_registry = {}
         self.frame_archive = {}
-        self.frame_active_memory = []
+        self.id_memory = []
+        self.scene_memory = []
         self._frame_kv_store = {}
 
     def clear_frame_store(self) -> None:
