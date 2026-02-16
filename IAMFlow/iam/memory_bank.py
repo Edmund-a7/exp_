@@ -204,6 +204,105 @@ class MemoryBank:
 
     # ============ 帧检索相关 ============
 
+    def _compute_dynamic_id_budget(self, required_entity_ids: List[str]) -> int:
+        """
+        根据 ID 覆盖度计算 ID Memory 需要的帧数 (贪心集合覆盖)
+
+        策略:
+        1. 优先选覆盖所有 ID 的帧 (1帧搞定 → budget=1)
+        2. 不够则贪心选覆盖最多未覆盖 ID 的帧
+        3. 直到所有 ID 被覆盖，budget = 选出的帧数
+        4. 上限 max_id_memory_frames
+
+        Args:
+            required_entity_ids: 需要覆盖的实体 ID 列表 (str)
+
+        Returns:
+            动态帧预算
+        """
+        if not required_entity_ids or not self.frame_archive:
+            return 0
+
+        uncovered = set(required_entity_ids)
+        budget = 0
+        used_frames = set()
+
+        while uncovered and budget < self.max_id_memory_frames:
+            best_fid = None
+            best_cover = 0
+            best_score = -float('inf')
+
+            for fid, fi in self.frame_archive.items():
+                if fid in used_frames:
+                    continue
+                cover = len(set(fi.associated_entities) & uncovered)
+                if cover > best_cover or (cover == best_cover and fi.entity_score > best_score):
+                    best_fid = fid
+                    best_cover = cover
+                    best_score = fi.entity_score
+
+            if best_fid is None or best_cover == 0:
+                break
+
+            used_frames.add(best_fid)
+            uncovered -= set(self.frame_archive[best_fid].associated_entities)
+            budget += 1
+
+        # 至少 1 帧 (如果有实体需求且有帧可覆盖)
+        return budget
+
+    def _greedy_select_id_frames(self, required_entity_ids: List[str], budget: int) -> List[str]:
+        """
+        贪心选择覆盖最多 ID 的帧集合
+
+        Args:
+            required_entity_ids: 需要覆盖的实体 ID 列表 (str)
+            budget: 帧预算
+
+        Returns:
+            选中的 frame_id 列表
+        """
+        if not required_entity_ids or not self.frame_archive or budget <= 0:
+            return []
+
+        uncovered = set(required_entity_ids)
+        selected = []
+
+        while uncovered and len(selected) < budget:
+            best_fid = None
+            best_cover = 0
+            best_score = -float('inf')
+
+            for fid, fi in self.frame_archive.items():
+                if fid in selected:
+                    continue
+                cover = len(set(fi.associated_entities) & uncovered)
+                if cover > best_cover or (cover == best_cover and fi.entity_score > best_score):
+                    best_fid = fid
+                    best_cover = cover
+                    best_score = fi.entity_score
+
+            if best_fid is None or best_cover == 0:
+                break
+
+            selected.append(best_fid)
+            uncovered -= set(self.frame_archive[best_fid].associated_entities)
+
+        # 如果还有预算剩余且 uncovered 为空，用 entity_score top-k 填充
+        if len(selected) < budget:
+            remaining = [
+                (fid, fi.entity_score)
+                for fid, fi in self.frame_archive.items()
+                if fid not in selected
+            ]
+            remaining.sort(key=lambda x: x[1], reverse=True)
+            for fid, _ in remaining:
+                if len(selected) >= budget:
+                    break
+                selected.append(fid)
+
+        return selected
+
     def retrieve_initial_frames(self, entity_ids: List[int],
                                 scene_texts: Optional[List[str]] = None) -> List[str]:
         """
@@ -225,27 +324,16 @@ class MemoryBank:
             print(f"[DEBUG] retrieve_initial_frames: No frames in archive")
             return []
 
-        # === ID Memory 路径: 按 entity 匹配 + entity_score ===
+        # === ID Memory 路径: 动态预算 + 贪心集合覆盖 ===
         entity_id_strs = [str(eid) for eid in entity_ids]
-        id_candidates = []
         if entity_id_strs:
-            for frame_id, frame_info in self.frame_archive.items():
-                intersection = set(frame_info.associated_entities) & set(entity_id_strs)
-                match_count = len(intersection)
-                if match_count > 0:
-                    combined = match_count * 10 + frame_info.entity_score
-                    id_candidates.append((frame_id, combined))
-
-            if not id_candidates:
-                # 有实体 ID 但无匹配，按 entity_score 取 top-k 作为兜底
-                id_candidates = [(fid, fi.entity_score) for fid, fi in self.frame_archive.items()]
-
-            id_candidates.sort(key=lambda x: x[1], reverse=True)
-            self.id_memory = [f[0] for f in id_candidates[:self.max_id_memory_frames]]
+            budget = self._compute_dynamic_id_budget(entity_id_strs)
+            self.id_memory = self._greedy_select_id_frames(entity_id_strs, budget)
+            print(f"[DEBUG] retrieve_initial_frames: dynamic budget={budget}, id_memory={self.id_memory}")
         else:
             # 无实体时不填充 ID Memory，保持双路径独立
             self.id_memory = []
-        print(f"[DEBUG] retrieve_initial_frames: id_memory={self.id_memory}")
+            print(f"[DEBUG] retrieve_initial_frames: no entities, id_memory=[]")
 
         # === Scene Memory 路径: 按 scene_score ===
         if scene_texts:
@@ -854,8 +942,36 @@ class MemoryBank:
             if not norm:
                 continue
             phrases.add(norm)
+
+            # 仅英文/数字 token
             tokens.update(re.findall(r"[a-z0-9]+", norm))
         return phrases, tokens
+
+    @staticmethod
+    def _compute_scene_distance(old_texts: List[str], new_texts: List[str]) -> float:
+        """
+        计算两组 scene text 的语义距离 (基于 token Jaccard)
+
+        Jaccard 距离: 1 - |A∩B| / |A∪B|
+
+        Args:
+            old_texts: 上一个 prompt 的场景文本
+            new_texts: 当前 prompt 的场景文本
+
+        Returns:
+            距离值 [0, 1]，0 = 完全相同，1 = 完全不同
+        """
+        _, old_tokens = MemoryBank._normalize_scene_texts(old_texts)
+        _, new_tokens = MemoryBank._normalize_scene_texts(new_texts)
+
+        if not old_tokens and not new_tokens:
+            return 0.0
+        if not old_tokens or not new_tokens:
+            return 1.0
+
+        intersection = len(old_tokens & new_tokens)
+        union = len(old_tokens | new_tokens)
+        return 1.0 - intersection / union
 
     def _compute_scene_relevance(self, frame_info: FrameInfo, query_scene_texts: List[str]) -> float:
         """计算 frame 与当前 scene query 的相关度。"""

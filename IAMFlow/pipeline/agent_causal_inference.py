@@ -89,12 +89,19 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             save_frames_to_disk=save_frames_to_disk
         )
 
+        # Phase 3: bank_size 需要容纳双层记忆的最大帧数 (id=4 + scene=2 = 6)
+        dual_memory_max = (self.agent_memory_bank.max_id_memory_frames
+                           + self.agent_memory_bank.max_scene_memory_frames)
+        if self.bank_size < dual_memory_max:
+            self.bank_size = dual_memory_max
+
         # 状态追踪
         self.current_prompt_id = 0
         self.current_chunk_id = 0
         self.current_entities: List[EntityStruct] = []
         self.current_prompt_text: str = ""  # 当前 prompt 文本，用于精确定位实体位置
         self.current_scene_texts: List[str] = []  # 当前 prompt 的场景文本 (Phase 2 双层记忆使用)
+        self.prev_scene_texts: List[str] = []  # Phase 3: 上一个 prompt 的场景文本，用于同场景跳过
 
         # P0 优化: 缓存 IAM bank 长度，避免在 forward 中调用 .item()
         self._iam_bank_length = 0
@@ -104,6 +111,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         self.max_memory_frames = max_memory_frames
         self.save_dir = save_dir
         self.save_frames_to_disk = save_frames_to_disk
+        self.scene_skip_threshold = 0.3  # Phase 3: 同场景跳过阈值
 
         # 确保保存目录存在
         os.makedirs(save_dir, exist_ok=True)
@@ -591,6 +599,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         self.current_entities = []
         self.current_prompt_text = ""
         self.current_scene_texts = []
+        self.prev_scene_texts = []
         self.agent_memory_bank.clear()
         self._iam_bank_length = 0
         # 重置 LLM Agent 的 ID 计数器，确保每次推理 global_registry 从 1 开始
@@ -647,22 +656,44 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
 
         print(f"[DEBUG] Global registry after update: {list(self.agent_memory_bank.global_registry.keys())}")
 
-        # 3. 检索初始记忆帧 (非首个 prompt) — 双路检索
+        # 3. 检索初始记忆帧 (非首个 prompt) — 双路检索 + 同场景跳过
         if not is_first_prompt and (entities or scene_texts):
             entity_ids = self.agent_memory_bank.get_entity_ids(entities) if entities else []
-            print(f"[DEBUG] Retrieving initial frames for entity_ids: {entity_ids}, scene_texts: {scene_texts}")
+
+            # Phase 3: 同场景跳过 — 场景未变时保留 scene_memory，只更新 id_memory
+            skip_scene = False
+            if self.prev_scene_texts and scene_texts:
+                scene_dist = self._compute_scene_distance(self.prev_scene_texts, scene_texts)
+                if scene_dist <= self.scene_skip_threshold:
+                    skip_scene = True
+                    print(f"[DEBUG] Scene unchanged (dist={scene_dist:.3f} <= {self.scene_skip_threshold}), skipping scene retrieval")
+                else:
+                    print(f"[DEBUG] Scene changed (dist={scene_dist:.3f} > {self.scene_skip_threshold}), re-retrieving scene memory")
+
+            print(f"[DEBUG] Retrieving initial frames for entity_ids: {entity_ids}, scene_texts: {scene_texts}, skip_scene={skip_scene}")
+            retrieve_scene = None if skip_scene else scene_texts
+            old_scene_memory = self.agent_memory_bank.scene_memory.copy() if skip_scene else []
+
             retrieved_frames = self.agent_memory_bank.retrieve_initial_frames(
-                entity_ids, scene_texts=scene_texts
+                entity_ids, scene_texts=retrieve_scene
             )
-            print(f"[DEBUG] Retrieved initial frames: {retrieved_frames}")
+
+            # 恢复被跳过的 scene_memory
+            if skip_scene:
+                self.agent_memory_bank.scene_memory = old_scene_memory
+
+            print(f"[DEBUG] Retrieved initial frames: {self.agent_memory_bank.frame_active_memory}")
             print(f"[DEBUG] id_memory={self.agent_memory_bank.id_memory}, scene_memory={self.agent_memory_bank.scene_memory}")
 
             if DEBUG:
-                print(f"[AgentPipeline] Retrieved initial frames: {retrieved_frames}")
+                print(f"[AgentPipeline] Retrieved initial frames: {self.agent_memory_bank.frame_active_memory}")
 
             # 注入检索到的帧
             self._inject_iam_memory_to_bank()
             print(f"[DEBUG] Injected memory frames to kv_bank")
+
+        # Phase 3: 更新 prev_scene_texts
+        self.prev_scene_texts = scene_texts
 
     def _process_chunk_eviction(self,
                                 current_start_frame: int,
@@ -820,6 +851,11 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
 
         if DEBUG:
             print(f"[AgentPipeline] Injected {memory_length} tokens from IAM to kv_bank (all {len(self.kv_bank1)} blocks)")
+
+    @staticmethod
+    def _compute_scene_distance(old_texts: List[str], new_texts: List[str]) -> float:
+        """计算两组 scene text 的语义距离，委托给 MemoryBank"""
+        return MemoryBank._compute_scene_distance(old_texts, new_texts)
 
     # ============ 辅助方法 ============
 

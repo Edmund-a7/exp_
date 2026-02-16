@@ -37,9 +37,10 @@
 ## 实现分 Phase
 
 ```
-Phase 1 ✅ → Phase 2 ✅ → Phase 3 → Phase 4 → Phase 5
-Scene提取     双层记忆      动态分配    VLM验证    Sparse Attn
-(已完成)      (已完成)     +场景跳过   (闭环)     (加速)
+Phase 1 ✅ → Phase 2 ✅ → Phase 3 ✅ → Phase 4 → Phase 5
+Scene提取     双层记忆      动态分配      VLM验证    Sparse Attn
+(已完成)      (已完成)     +场景跳过     (闭环)     (加速)
+                           (已完成)
 ```
 
 依赖关系：Phase 2 是后续所有 Phase 的基础。Phase 3/4/5 之间相互独立，可并行开发。
@@ -186,11 +187,21 @@ def get_memory_kv(self, device=None):
 
 ---
 
-## Phase 3: 动态帧分配 + 同场景跳过
+## Phase 3: 动态帧分配 + 同场景跳过 ✅ 已完成
 
 **目标:** ID Memory 帧数根据 ID 覆盖度动态调整；场景未变时跳过 Scene Memory 检索。
 
-**改动文件:** `iam/memory_bank.py`, `pipeline/agent_causal_inference.py`
+**改动文件:** `iam/memory_bank.py`, `pipeline/agent_causal_inference.py`, `configs/agent_*.yaml`, `tests/test_dynamic_allocation.py`
+
+**完成内容:**
+- 新增 `_compute_dynamic_id_budget()` 贪心集合覆盖算法，动态计算 ID Memory 帧预算
+- 新增 `_greedy_select_id_frames()` 贪心帧选择，覆盖最多 ID + entity_score 打破平局
+- `retrieve_initial_frames()` 改用动态预算替代固定 top-k
+- 新增 `_compute_scene_distance()` 基于 token Jaccard 的场景距离计算
+- Pipeline 新增 `prev_scene_texts` 状态 + `scene_skip_threshold` (默认 0.3)
+- `_process_prompt_start()` 同场景跳过: 距离 ≤ 阈值时保留 scene_memory 不重新检索
+- `bank_size` 从固定 3 改为动态上限 6 (max_id=4 + max_scene=2)，config YAML 同步更新
+- 31 个新测试全部通过，92 个总测试零回归
 
 ### 3.1 ID 覆盖度动态帧分配
 
@@ -422,14 +433,14 @@ Phase 2: 双层记忆 ✅ 已完成
   ✅ 2.10 Pipeline: _inject_iam_memory_to_bank() 拼接注入 (通过 property 自动去重)
   ✅ 2.11 单元测试 + 集成测试 + 回归测试 (32 new, 61 total)
 
-Phase 3: 动态分配 + 场景跳过 [P1 - 效率优化]
-  □ 3.1 _compute_dynamic_id_budget() ID 覆盖度计算
-  □ 3.2 贪心帧选择: 覆盖所有 ID 的最小帧集
-  □ 3.3 动态 max_id_memory_frames (1~4)
-  □ 3.4 prev_scene_texts 状态 + 语义距离计算
-  □ 3.5 同场景跳过逻辑 (阈值可配置，默认 0.3)
-  □ 3.6 bank_size 从固定 3 改为动态上限 6
-  □ 3.7 测试: 多 prompt 场景验证帧分配合理性
+Phase 3: 动态分配 + 场景跳过 ✅ 已完成
+  ✅ 3.1 _compute_dynamic_id_budget() ID 覆盖度计算 (贪心集合覆盖)
+  ✅ 3.2 _greedy_select_id_frames() 贪心帧选择: 覆盖所有 ID 的最小帧集
+  ✅ 3.3 retrieve_initial_frames() 使用动态预算替代固定 top-k
+  ✅ 3.4 prev_scene_texts 状态 + _compute_scene_distance() (token Jaccard)
+  ✅ 3.5 同场景跳过逻辑 (阈值可配置，默认 0.3)
+  ✅ 3.6 bank_size 从固定 3 改为动态上限 6 (pipeline 自动覆盖 + config 更新)
+  ✅ 3.7 测试: 31 new tests, 92 total, 零回归
 
 Phase 4: VLM 视觉验证 [P2 - 闭环增强]
   □ 4.1 新增 iam/vlm_agent.py (VLMAgent 类)

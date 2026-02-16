@@ -97,6 +97,10 @@ class DummyMemoryBankPromptStart:
         self.retrieve_calls = []
         self.register_calls = []
 
+    @property
+    def frame_active_memory(self):
+        return list(dict.fromkeys(self.id_memory + self.scene_memory))
+
     def register_entities(self, entities, prompt_id, registry_update):
         self.register_calls.append((entities, prompt_id, registry_update))
 
@@ -105,6 +109,10 @@ class DummyMemoryBankPromptStart:
 
     def retrieve_initial_frames(self, entity_ids, scene_texts=None):
         self.retrieve_calls.append((entity_ids, scene_texts))
+        if scene_texts is None:
+            self.scene_memory = []
+            return self.frame_active_memory
+
         self.scene_memory = ["scene_frame_1"]
         return ["scene_frame_1"]
 
@@ -177,6 +185,8 @@ def test_process_prompt_start_retrieves_scene_memory_without_entities():
     pipeline.current_entities = []
     pipeline.current_prompt_text = ""
     pipeline.current_scene_texts = []
+    pipeline.prev_scene_texts = []
+    pipeline.scene_skip_threshold = 0.3
     pipeline.llm_agent = DummyLLMAgentSceneOnly()
     pipeline.agent_memory_bank = DummyMemoryBankPromptStart()
     pipeline.injected = False
@@ -213,3 +223,59 @@ def test_process_chunk_eviction_runs_with_scene_only_context():
 
     assert pipeline.agent_memory_bank.update_id_calls == [("p2_c3_f0", 0.1)]
     assert pipeline.agent_memory_bank.update_scene_calls == [("p2_c3_f0", 0.9)]
+
+
+def test_process_prompt_start_skips_scene_retrieval_when_scene_unchanged():
+    AgentCausalInferencePipeline = _load_agent_pipeline_class()
+    pipeline = AgentCausalInferencePipeline.__new__(AgentCausalInferencePipeline)
+    pipeline.current_prompt_id = 1
+    pipeline.current_chunk_id = 0
+    pipeline.current_entities = []
+    pipeline.current_prompt_text = ""
+    pipeline.current_scene_texts = []
+    pipeline.prev_scene_texts = ["snowy forest", "pine trees"]
+    pipeline.scene_skip_threshold = 0.3
+    pipeline._compute_scene_distance = lambda old, new: 0.1
+    pipeline.llm_agent = DummyLLMAgentSceneOnly()
+    pipeline.agent_memory_bank = DummyMemoryBankPromptStart()
+    pipeline.agent_memory_bank.scene_memory = ["old_scene_frame"]
+    pipeline.injected = False
+    pipeline._inject_iam_memory_to_bank = lambda: setattr(pipeline, "injected", True)
+
+    pipeline._process_prompt_start(
+        prompt_text="A quiet snowy forest landscape",
+        prompt_id=2,
+        is_first_prompt=False,
+    )
+
+    assert pipeline.agent_memory_bank.retrieve_calls == [([], None)]
+    assert pipeline.agent_memory_bank.scene_memory == ["old_scene_frame"]
+    assert pipeline.injected is True
+
+
+def test_process_prompt_start_reretrieves_scene_when_scene_changed():
+    AgentCausalInferencePipeline = _load_agent_pipeline_class()
+    pipeline = AgentCausalInferencePipeline.__new__(AgentCausalInferencePipeline)
+    pipeline.current_prompt_id = 1
+    pipeline.current_chunk_id = 0
+    pipeline.current_entities = []
+    pipeline.current_prompt_text = ""
+    pipeline.current_scene_texts = []
+    pipeline.prev_scene_texts = ["city street", "neon lights"]
+    pipeline.scene_skip_threshold = 0.3
+    pipeline._compute_scene_distance = lambda old, new: 0.9
+    pipeline.llm_agent = DummyLLMAgentSceneOnly()
+    pipeline.agent_memory_bank = DummyMemoryBankPromptStart()
+    pipeline.agent_memory_bank.scene_memory = ["old_scene_frame"]
+    pipeline.injected = False
+    pipeline._inject_iam_memory_to_bank = lambda: setattr(pipeline, "injected", True)
+
+    pipeline._process_prompt_start(
+        prompt_text="A quiet snowy forest landscape",
+        prompt_id=2,
+        is_first_prompt=False,
+    )
+
+    assert pipeline.agent_memory_bank.retrieve_calls == [([], ["snowy forest", "pine trees"])]
+    assert pipeline.agent_memory_bank.scene_memory == ["scene_frame_1"]
+    assert pipeline.injected is True
