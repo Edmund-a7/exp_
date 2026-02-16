@@ -197,8 +197,8 @@ class LLMWrapper:
         """使用 vLLM 生成"""
         sampling_params = self._sampling_params(
             max_tokens=max_new_tokens,
-            temperature=temperature if temperature > 0 else 0.01,
-            top_p=0.9,
+            temperature=temperature,
+            top_p=0.9 if temperature > 0 else 1.0,
         )
 
         outputs = self._model.generate([prompt], sampling_params)
@@ -238,7 +238,8 @@ class EntityStructExtractor:
 
 RULES:
 1. "entities": ONLY human/person characters (man, woman, protagonist, etc.)
-   - Extract visual attributes as a string list
+   - Extract ONLY visual/physical attributes: hair, clothing, accessories, body type, age, skin, facial features
+   - DO NOT extract behavioral states (walking, nodding, reading, sitting) or emotions (quiet, contemplative, happy)
    - Keep entity names short
 2. "scene": environment, background, lighting, weather, objects, locations
    - Each element is a short descriptive phrase
@@ -269,7 +270,7 @@ If no scene elements found, scene should be []."""
             system_prompt=self.SYSTEM_PROMPT,
             user_prompt=prompt,
             max_new_tokens=1024,
-            temperature=0.1
+            temperature=0
         )
 
         entities_data, scene_texts = self._parse_response(response)
@@ -516,7 +517,7 @@ Output JSON only: {{"matched_id": <number or null>}}"""
             system_prompt=self.MATCHING_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             max_new_tokens=256,
-            temperature=0.1
+            temperature=0
         )
 
         matched_id = self._parse_matching_response(response)

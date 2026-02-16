@@ -449,7 +449,7 @@ class MemoryBank:
             frame_id=frame_id,
             frame_path=os.path.join(self.save_dir, f"{frame_id}.pt"),
             prompt_id=prompt_id,
-            associated_entities=[str(eid) for eid in current_entity_ids],
+            associated_entities=list(dict.fromkeys(str(eid) for eid in current_entity_ids)),
             score=best_score,
             entity_score=best_entity_score,
             scene_score=best_scene_score,
