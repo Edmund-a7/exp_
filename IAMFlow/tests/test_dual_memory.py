@@ -224,6 +224,37 @@ class TestDualPathScoring:
         expected = 0.6 * fi.entity_score + 0.4 * fi.scene_score
         assert abs(fi.score - expected) < 1e-4
 
+    def test_select_uses_configurable_fusion_weights(self, tmp_path, entities_p1):
+        memory_bank = MemoryBank(
+            text_encoder=None,
+            max_memory_frames=3,
+            max_id_memory_frames=4,
+            max_scene_memory_frames=2,
+            entity_memory_weight=0.72,
+            scene_memory_weight=0.28,
+            frame_seq_length=1560,
+            num_transformer_blocks=2,
+            save_dir=str(tmp_path),
+        )
+        memory_bank.register_entities(entities_p1, prompt_id=1)
+
+        chunk_kv = _make_mock_kv(num_blocks=2)
+        crossattn = _make_mock_crossattn(num_blocks=2)
+
+        frame_id, _ = memory_bank.select_frame_from_chunk(
+            evicted_chunk_kv=chunk_kv,
+            crossattn_cache=crossattn,
+            prompt_id=1, chunk_id=3,
+            current_entity_ids=[1],
+            current_entities=entities_p1,
+            prompt_text=PROMPT_P1,
+            scene_texts=SCENE_P1,
+        )
+
+        fi = memory_bank.frame_archive[frame_id]
+        expected = 0.72 * fi.entity_score + 0.28 * fi.scene_score
+        assert abs(fi.score - expected) < 1e-4
+
     def test_select_without_scene_texts(self, memory_bank, entities_p1):
         """无 scene_texts 时 scene_score 为 0"""
         memory_bank.register_entities(entities_p1, prompt_id=1)

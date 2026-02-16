@@ -1,3 +1,4 @@
+# IAM Agent Inference Configuration (AB-A preset: 0.72/0.28, threshold=0.30)
 # IAM Agent Inference Configuration
 # Based on interactive_inference.yaml with IAM-specific settings
 
@@ -27,7 +28,7 @@ model_kwargs:
 
 # Inference
 data_path: prompts/interactive_example.jsonl
-output_folder: videos/iam_interactive
+output_folder: videos/iam_interactive_ab_a
 inference_iter: -1
 num_output_frames: 240
 use_ema: false
@@ -70,7 +71,7 @@ save_dir: data/agent_frames
 use_vllm: true  # 使用 vLLM 加速 LLM 推理 (需要安装 vllm)
 entity_memory_weight: 0.72
 scene_memory_weight: 0.28
-scene_skip_threshold: 0.22
+scene_skip_threshold: 0.3
 min_id_memory_frames_multi_entity: 2
 min_scene_memory_frames: 1
 scene_budget_token_threshold: 4

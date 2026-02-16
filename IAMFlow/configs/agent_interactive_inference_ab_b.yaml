@@ -1,3 +1,4 @@
+# IAM Agent Inference Configuration (AB-B preset: 0.72/0.28, threshold=0.22)
 # IAM Agent Inference Configuration
 # Based on interactive_inference.yaml with IAM-specific settings
 
@@ -27,7 +28,7 @@ model_kwargs:
 
 # Inference
 data_path: prompts/interactive_example.jsonl
-output_folder: videos/iam_interactive
+output_folder: videos/iam_interactive_ab_b
 inference_iter: -1
 num_output_frames: 240
 use_ema: false

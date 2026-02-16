@@ -54,3 +54,9 @@ adapter:
 llm_model_path: ../Qwen3-4B-Instruct-2507
 max_memory_frames: 3
 save_dir: data/agent_frames
+entity_memory_weight: 0.72
+scene_memory_weight: 0.28
+scene_skip_threshold: 0.22
+min_id_memory_frames_multi_entity: 2
+min_scene_memory_frames: 1
+scene_budget_token_threshold: 4

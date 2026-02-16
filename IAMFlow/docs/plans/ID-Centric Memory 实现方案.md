@@ -25,10 +25,6 @@
 
 | 模块 | 框架设计 | 当前状态 |
 |------|---------|---------|
-| 双层记忆 | ID Memory + Scene Memory 独立检索 | 单一 active_memory，无分层 |
-| Scene 检索 | scene text 直接对 Frame Archive 打分 | 不存在 |
-| 同场景跳过 | 语义距离 ≤ 阈值 → 零开销 | 不存在 |
-| 动态帧分配 | 按 ID 覆盖度动态调整 1~4 帧 | 固定 3 帧 top-k |
 | VLM 视觉验证 | 第一个 chunk 后校验 entity attrs | 不存在 |
 | Block-wise Sparse Attention | 帧级粗筛 + token block 细筛 | TCAT 机制不同 |
 
@@ -68,17 +64,17 @@ Scene提取     双层记忆      动态分配      VLM验证    Sparse Attn
 **改动文件:** `iam/memory_bank.py`, `pipeline/agent_causal_inference.py`, `tests/test_dual_memory.py`
 
 **完成内容:**
-- `FrameInfo` 新增 `entity_score` / `scene_score` 双分数字段
+- `FrameInfo` 新增 `entity_score` / `scene_score` / `scene_texts` 字段
 - `MemoryBank` 拆分为 `id_memory` (max 4帧) + `scene_memory` (max 2帧)，`frame_active_memory` 改为去重合并的 property
 - 新增 `_build_scene_token_weights()` 场景权重构建（与 entity 权重互补）
-- `select_frame_from_chunk()` 双路打分: entity_scores + scene_scores → 综合分数 0.6/0.4
+- `select_frame_from_chunk()` 双路打分，综合分数权重可配置 (`entity_memory_weight` / `scene_memory_weight`)
 - 提取 `_consensus_score()` 通用多层共识打分方法，消除代码重复
 - 新增 `update_id_memory()` / `update_scene_memory()` 独立 top-k 更新
-- `retrieve_initial_frames()` 双路检索: ID 匹配 + scene_score 排序
+- `retrieve_initial_frames()` 双路检索: ID 路径 + scene query 相关度路径
 - Pipeline `_process_chunk_eviction()` 改为双路更新
 - Pipeline `_process_prompt_start()` 传入 scene_texts 进行双路检索
 - JSON 持久化支持双层记忆，向后兼容旧格式
-- 32 个单元测试全部通过，61 个总测试零回归
+- 当前 `IAMFlow/tests` 共 98 个测试通过（含双层记忆与动态分配相关回归）
 
 ### 2.1 数据结构重构
 
@@ -93,6 +89,7 @@ class FrameInfo:
     associated_entities: List[str]
     entity_score: float          # 新增: entity 维度分数
     scene_score: float           # 新增: scene 维度分数
+    scene_texts: List[str]       # 新增: 该帧关联的 scene 文本
     score: float                 # 保留: 综合分数 (向后兼容)
     kv_cache: Optional[...] = None
 ```
@@ -135,7 +132,10 @@ def select_frame_from_chunk(self, ..., scene_texts=None):
     scene_scores = self._score_frames(chunk_kv, crossattn_cache, scene_weights)
 
     # 3. 综合分数 (用于 frame_archive 排序)
-    combined_scores = 0.6 * entity_scores + 0.4 * scene_scores
+    combined_scores = (
+        self.entity_memory_weight * entity_scores
+        + self.scene_memory_weight * scene_scores
+    )
 
     # 4. 存储双分数到 FrameInfo
     frame_info.entity_score = entity_scores[best_idx]
@@ -183,7 +183,7 @@ def get_memory_kv(self, device=None):
 
 - 单元测试: 双路打分、独立更新、去重拼接
 - 集成测试: 3-prompt 场景验证 id_memory 和 scene_memory 分别包含正确的帧
-- 回归测试: 确保现有 29 个测试不受影响
+- 回归测试: 已纳入当前 `IAMFlow/tests` 全量回归（98 passed）
 
 ---
 
@@ -197,11 +197,13 @@ def get_memory_kv(self, device=None):
 - 新增 `_compute_dynamic_id_budget()` 贪心集合覆盖算法，动态计算 ID Memory 帧预算
 - 新增 `_greedy_select_id_frames()` 贪心帧选择，覆盖最多 ID + entity_score 打破平局
 - `retrieve_initial_frames()` 改用动态预算替代固定 top-k
+- 新增多实体下限策略：`min_id_memory_frames_multi_entity=2`（最终 ID 预算 2~4）
+- 新增 `_compute_dynamic_scene_budget()`：Scene 预算动态 1~2 (`min_scene_memory_frames=1`)
 - 新增 `_compute_scene_distance()` 基于 token Jaccard 的场景距离计算
-- Pipeline 新增 `prev_scene_texts` 状态 + `scene_skip_threshold` (默认 0.3)
+- Pipeline 新增 `prev_scene_texts` 状态 + `scene_skip_threshold`（代码默认 0.3，当前默认配置采用 B: 0.22）
 - `_process_prompt_start()` 同场景跳过: 距离 ≤ 阈值时保留 scene_memory 不重新检索
 - `bank_size` 从固定 3 改为动态上限 6 (max_id=4 + max_scene=2)，config YAML 同步更新
-- 31 个新测试全部通过，92 个总测试零回归
+- 当前 `IAMFlow/tests` 共 98 个测试通过，零回归
 
 ### 3.1 ID 覆盖度动态帧分配
 
@@ -216,6 +218,10 @@ def _compute_dynamic_id_budget(self, required_entity_ids: List[str]) -> int:
     3. 直到所有 ID 被覆盖，budget = 选出的帧数
     4. 上限 max_id_memory_frames (默认4)
     """
+
+# 多实体时应用下限（若候选帧足够）
+if len(set(required_entity_ids)) >= 2 and len(frame_archive) >= 2:
+    budget = max(budget, min_id_memory_frames_multi_entity)  # 默认 2
 ```
 
 帧选择的贪心算法:
@@ -240,7 +246,7 @@ def _process_prompt_start(self, ...):
         scene_distance = self._compute_scene_distance(
             self.prev_scene_texts, scene_texts
         )
-        if scene_distance <= self.scene_skip_threshold:  # 默认 0.3
+        if scene_distance <= self.scene_skip_threshold:  # 当前默认配置 B: 0.22
             # 场景未变，Scene Memory 保持不动，零开销
             print(f"[DEBUG] Scene unchanged (dist={scene_distance:.3f}), skipping retrieval")
         else:
@@ -250,26 +256,24 @@ def _process_prompt_start(self, ...):
     self.prev_scene_texts = scene_texts
 ```
 
-语义距离计算复用 text_encoder:
+语义距离计算采用 token Jaccard:
 
 ```python
 def _compute_scene_distance(self, old_texts, new_texts):
     """
     计算两组 scene text 的语义距离
-    方案: 拼接为句子 → text_encoder 编码 → cosine distance
+    方案: token Jaccard distance
     """
-    old_str = ", ".join(old_texts)
-    new_str = ", ".join(new_texts)
-    old_emb = self.text_encoder([old_str])["prompt_embeds"].mean(dim=(0,1))
-    new_emb = self.text_encoder([new_str])["prompt_embeds"].mean(dim=(0,1))
-    return 1.0 - F.cosine_similarity(old_emb.unsqueeze(0), new_emb.unsqueeze(0)).item()
+    old_tokens = normalize(old_texts)
+    new_tokens = normalize(new_texts)
+    return 1.0 - len(old_tokens & new_tokens) / len(old_tokens | new_tokens)
 ```
 
 ### 3.3 KV Cache 结构调整
 
 ```
 KV cache = sink + ID mem + scene mem + local
-           (2)    (动态1~4)  (1~2)      (6)
+           (2)    (动态2~4)  (动态1~2)  (6)
            ─────────────────────────────────
                         总计 ~12 帧
 ```
@@ -278,7 +282,7 @@ KV cache = sink + ID mem + scene mem + local
 
 ### 3.4 测试计划
 
-- 单元测试: 贪心覆盖算法、动态 budget 计算
+- 单元测试: 贪心覆盖算法、动态 budget 计算 (ID 2~4, Scene 1~2)
 - 场景跳过: 相同 scene → 跳过，不同 scene → 重新检索
 - 帧预算: 验证总帧数不超过上限
 
@@ -431,16 +435,18 @@ Phase 2: 双层记忆 ✅ 已完成
   ✅ 2.8 Pipeline: _process_prompt_start() 双路检索
   ✅ 2.9 Pipeline: _process_chunk_eviction() 双路更新
   ✅ 2.10 Pipeline: _inject_iam_memory_to_bank() 拼接注入 (通过 property 自动去重)
-  ✅ 2.11 单元测试 + 集成测试 + 回归测试 (32 new, 61 total)
+  ✅ 2.11 单元测试 + 集成测试 + 回归测试（已纳入当前 98 tests）
 
 Phase 3: 动态分配 + 场景跳过 ✅ 已完成
   ✅ 3.1 _compute_dynamic_id_budget() ID 覆盖度计算 (贪心集合覆盖)
   ✅ 3.2 _greedy_select_id_frames() 贪心帧选择: 覆盖所有 ID 的最小帧集
   ✅ 3.3 retrieve_initial_frames() 使用动态预算替代固定 top-k
   ✅ 3.4 prev_scene_texts 状态 + _compute_scene_distance() (token Jaccard)
-  ✅ 3.5 同场景跳过逻辑 (阈值可配置，默认 0.3)
+  ✅ 3.5 同场景跳过逻辑 (阈值可配置，当前默认配置 B: 0.22)
   ✅ 3.6 bank_size 从固定 3 改为动态上限 6 (pipeline 自动覆盖 + config 更新)
-  ✅ 3.7 测试: 31 new tests, 92 total, 零回归
+  ✅ 3.7 多实体最小 ID 预算: `min_id_memory_frames_multi_entity=2` (ID 2~4)
+  ✅ 3.8 动态 Scene 预算: `min_scene_memory_frames=1` + `scene_budget_token_threshold=4` (Scene 1~2)
+  ✅ 3.9 测试: 当前 `IAMFlow/tests` 98 tests 通过，零回归
 
 Phase 4: VLM 视觉验证 [P2 - 闭环增强]
   □ 4.1 新增 iam/vlm_agent.py (VLMAgent 类)
@@ -463,7 +469,7 @@ Phase 5: Block-wise Sparse Attention [P2 - 加速]
 
 1. **显存预算**: 双层记忆最多 6 帧 (id=4 + scene=2)，比原来的 3 帧多一倍。需要确认 bank_size 扩大后显存是否够用。建议先在 1.3B 模型上验证。
 
-2. **Scene 打分质量**: scene token 权重依赖 prompt 中 scene 描述的位置。如果 prompt 格式不规范（scene 和 entity 混在一起），权重可能不准。可以考虑用 LLM 提取的 scene_texts 重新编码为独立 query，而非从 crossattn_cache 中加权。
+2. **Scene 打分质量**: 当前实现按英文 token 做 scene 距离与复杂度估计，假设输入 prompt 为英文；若后续引入多语 prompt，需要同步扩展 token 归一化策略。
 
 3. **VLM 延迟**: VLM 推理 + VAE decode 会增加每个 prompt 首 chunk 的延迟。需要评估是否值得。可以先作为离线验证工具，不阻塞生成流程。
 

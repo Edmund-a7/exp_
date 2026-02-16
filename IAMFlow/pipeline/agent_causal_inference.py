@@ -79,10 +79,25 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         self.llm_agent = LLMAgent(model_path=llm_model_path, use_vllm=use_vllm,
                                   gpu_memory_utilization=gpu_memory_utilization)
 
+        # 双路融合与场景跳过配置（可在 YAML 顶层覆盖）
+        self.entity_memory_weight = float(getattr(args, "entity_memory_weight", 0.6))
+        self.scene_memory_weight = float(getattr(args, "scene_memory_weight", 0.4))
+        self.scene_skip_threshold = float(getattr(args, "scene_skip_threshold", 0.3))
+        self.min_id_memory_frames_multi_entity = int(
+            getattr(args, "min_id_memory_frames_multi_entity", 2)
+        )
+        self.min_scene_memory_frames = int(getattr(args, "min_scene_memory_frames", 1))
+        self.scene_budget_token_threshold = int(getattr(args, "scene_budget_token_threshold", 4))
+
         # 初始化 Memory Bank (使用父类的 text_encoder)
         self.agent_memory_bank = MemoryBank(
             text_encoder=self.text_encoder,
             max_memory_frames=max_memory_frames,
+            min_id_memory_frames_multi_entity=self.min_id_memory_frames_multi_entity,
+            min_scene_memory_frames=self.min_scene_memory_frames,
+            scene_budget_token_threshold=self.scene_budget_token_threshold,
+            entity_memory_weight=self.entity_memory_weight,
+            scene_memory_weight=self.scene_memory_weight,
             frame_seq_length=self.frame_seq_length,
             num_transformer_blocks=self.num_transformer_blocks,
             save_dir=save_dir,
@@ -111,7 +126,6 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         self.max_memory_frames = max_memory_frames
         self.save_dir = save_dir
         self.save_frames_to_disk = save_frames_to_disk
-        self.scene_skip_threshold = 0.3  # Phase 3: 同场景跳过阈值
 
         # 确保保存目录存在
         os.makedirs(save_dir, exist_ok=True)

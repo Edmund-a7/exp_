@@ -68,6 +68,11 @@ class MemoryBank:
                  max_memory_frames: int = 3,
                  max_id_memory_frames: int = 4,
                  max_scene_memory_frames: int = 2,
+                 min_id_memory_frames_multi_entity: int = 2,
+                 min_scene_memory_frames: int = 1,
+                 scene_budget_token_threshold: int = 4,
+                 entity_memory_weight: float = 0.6,
+                 scene_memory_weight: float = 0.4,
                  frame_seq_length: int = 1560,
                  num_transformer_blocks: int = 30,
                  save_dir: str = "data",
@@ -80,6 +85,11 @@ class MemoryBank:
             max_memory_frames: 最大记忆帧数量 (向后兼容，仅在未启用双层记忆时使用)
             max_id_memory_frames: ID Memory 最大帧数 (entity 驱动，1~4 帧)
             max_scene_memory_frames: Scene Memory 最大帧数 (scene 驱动，1~2 帧)
+            min_id_memory_frames_multi_entity: 多实体时 ID Memory 最小帧数
+            min_scene_memory_frames: Scene Memory 最小帧数
+            scene_budget_token_threshold: scene token 数达到该阈值时使用 max_scene_memory_frames
+            entity_memory_weight: 双路融合中 entity 分数权重
+            scene_memory_weight: 双路融合中 scene 分数权重
             frame_seq_length: 每帧的序列长度
             num_transformer_blocks: transformer block 数量 (默认30)
             save_dir: 帧数据保存目录
@@ -89,6 +99,19 @@ class MemoryBank:
         self.max_memory_frames = max_memory_frames
         self.max_id_memory_frames = max_id_memory_frames
         self.max_scene_memory_frames = max_scene_memory_frames
+        self.min_id_memory_frames_multi_entity = max(
+            1,
+            min(min_id_memory_frames_multi_entity, self.max_id_memory_frames),
+        )
+        self.min_scene_memory_frames = max(
+            1,
+            min(min_scene_memory_frames, self.max_scene_memory_frames),
+        )
+        self.scene_budget_token_threshold = max(1, int(scene_budget_token_threshold))
+        self.entity_memory_weight, self.scene_memory_weight = self._normalize_path_weights(
+            entity_memory_weight,
+            scene_memory_weight,
+        )
         self.frame_seq_length = frame_seq_length
         self.num_transformer_blocks = num_transformer_blocks
         self.save_dir = save_dir
@@ -112,6 +135,16 @@ class MemoryBank:
     def frame_active_memory(self) -> List[str]:
         """向后兼容属性: 返回 id_memory + scene_memory 的去重合并"""
         return list(dict.fromkeys(self.id_memory + self.scene_memory))
+
+    @staticmethod
+    def _normalize_path_weights(entity_weight: float, scene_weight: float) -> Tuple[float, float]:
+        """归一化双路融合权重，异常输入回退到默认 0.6/0.4。"""
+        entity = max(float(entity_weight), 0.0)
+        scene = max(float(scene_weight), 0.0)
+        total = entity + scene
+        if total <= 1e-8:
+            return 0.6, 0.4
+        return entity / total, scene / total
 
     @frame_active_memory.setter
     def frame_active_memory(self, value: List[str]):
@@ -328,6 +361,12 @@ class MemoryBank:
         entity_id_strs = [str(eid) for eid in entity_ids]
         if entity_id_strs:
             budget = self._compute_dynamic_id_budget(entity_id_strs)
+
+            # Phase 4 调优: 多实体时 ID Memory 至少 2 帧（上限仍受 max_id_memory_frames 约束）
+            if len(set(entity_id_strs)) >= 2 and len(self.frame_archive) >= 2:
+                budget = max(budget, self.min_id_memory_frames_multi_entity)
+
+            budget = min(budget, self.max_id_memory_frames)
             self.id_memory = self._greedy_select_id_frames(entity_id_strs, budget)
             print(f"[DEBUG] retrieve_initial_frames: dynamic budget={budget}, id_memory={self.id_memory}")
         else:
@@ -337,6 +376,7 @@ class MemoryBank:
 
         # === Scene Memory 路径: 按 scene_score ===
         if scene_texts:
+            scene_budget = self._compute_dynamic_scene_budget(scene_texts)
             scene_candidates = []
             for fid, fi in self.frame_archive.items():
                 relevance = self._compute_scene_relevance(fi, scene_texts)
@@ -344,8 +384,8 @@ class MemoryBank:
 
             # 先按当前 scene query 的匹配度排序，再用历史 scene_score 打破平局
             scene_candidates.sort(key=lambda x: (x[1], x[2]), reverse=True)
-            self.scene_memory = [f[0] for f in scene_candidates[:self.max_scene_memory_frames]]
-            print(f"[DEBUG] retrieve_initial_frames: scene_memory={self.scene_memory}")
+            self.scene_memory = [f[0] for f in scene_candidates[:scene_budget]]
+            print(f"[DEBUG] retrieve_initial_frames: scene_budget={scene_budget}, scene_memory={self.scene_memory}")
         else:
             self.scene_memory = []
 
@@ -425,7 +465,8 @@ class MemoryBank:
                 scene_scores = torch.zeros(num_candidate_frames, device=device, dtype=dtype)
 
         # 3. 综合分数
-        combined_scores = 0.6 * entity_scores + 0.4 * scene_scores
+        combined_scores = (self.entity_memory_weight * entity_scores
+                           + self.scene_memory_weight * scene_scores)
 
         # 选择最高分帧
         best_frame_idx = combined_scores.argmax().item()
@@ -988,6 +1029,26 @@ class MemoryBank:
 
         # 当前 query 匹配度为主，历史 scene_score 作为轻量先验
         return 0.7 * phrase_overlap + 0.2 * token_overlap + 0.1 * max(0.0, frame_info.scene_score)
+
+    def _compute_dynamic_scene_budget(self, scene_texts: Optional[List[str]]) -> int:
+        """
+        根据 scene query 复杂度计算 Scene Memory 预算（1~2）。
+
+        规则：
+        - 无 scene query: 0
+        - token 数 < scene_budget_token_threshold: min_scene_memory_frames
+        - token 数 >= scene_budget_token_threshold: max_scene_memory_frames
+        """
+        if not scene_texts:
+            return 0
+
+        _, scene_tokens = self._normalize_scene_texts(scene_texts)
+        if len(scene_tokens) >= self.scene_budget_token_threshold:
+            budget = self.max_scene_memory_frames
+        else:
+            budget = self.min_scene_memory_frames
+
+        return max(self.min_scene_memory_frames, min(budget, self.max_scene_memory_frames))
 
     def _save_frame_kv(self, frame_id: str, frame_kv: List[Dict[str, torch.Tensor]]) -> None:
         """保存帧KV到文件 (所有 block)"""

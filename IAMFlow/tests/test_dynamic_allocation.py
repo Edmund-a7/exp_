@@ -192,6 +192,42 @@ class TestRetrieveWithDynamicBudget:
         assert len(memory_bank.scene_memory) > 0
         assert len(memory_bank.scene_memory) <= memory_bank.max_scene_memory_frames
 
+    def test_multi_entity_budget_has_minimum_two(self, memory_bank):
+        """多实体时 ID budget 至少为 2（若候选帧足够）。"""
+        _add_frame(memory_bank, "f_all", [1, 2], entity_score=0.9)
+        _add_frame(memory_bank, "f_extra", [1], entity_score=0.8)
+        _add_frame(memory_bank, "f_extra2", [2], entity_score=0.7)
+
+        memory_bank.retrieve_initial_frames([1, 2])
+        assert len(memory_bank.id_memory) >= 2
+
+    def test_scene_budget_simple_query_uses_one_frame(self, memory_bank):
+        """简单场景 query 优先使用 1 帧 scene memory。"""
+        _add_frame(memory_bank, "f1", [1], entity_score=0.8, scene_score=0.9,
+                   scene_texts=["park"])
+        _add_frame(memory_bank, "f2", [2], entity_score=0.7, scene_score=0.8,
+                   scene_texts=["park"])
+        _add_frame(memory_bank, "f3", [3], entity_score=0.6, scene_score=0.7,
+                   scene_texts=["park"])
+
+        memory_bank.retrieve_initial_frames([1], scene_texts=["park"])
+        assert len(memory_bank.scene_memory) == 1
+
+    def test_scene_budget_rich_query_can_use_two_frames(self, memory_bank):
+        """信息更丰富的场景 query 允许使用 2 帧 scene memory。"""
+        _add_frame(memory_bank, "f1", [1], entity_score=0.8, scene_score=0.9,
+                   scene_texts=["modern city park", "daytime", "bench"])
+        _add_frame(memory_bank, "f2", [2], entity_score=0.7, scene_score=0.8,
+                   scene_texts=["modern city park", "daytime", "trees"])
+        _add_frame(memory_bank, "f3", [3], entity_score=0.6, scene_score=0.7,
+                   scene_texts=["modern city park", "daytime", "fountain"])
+
+        memory_bank.retrieve_initial_frames(
+            [1],
+            scene_texts=["modern city park", "daytime", "bench"],
+        )
+        assert len(memory_bank.scene_memory) == 2
+
 
 # ============ 4. Scene Distance ============
 
