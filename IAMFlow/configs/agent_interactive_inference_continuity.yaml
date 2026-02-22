@@ -8,15 +8,14 @@ denoising_step_list:
   - 500
   - 250
 warp_denoising_step: true
-num_frame_per_block: 1
+num_frame_per_block: 3
 model_name: Wan2.1-T2V-1.3B
 model_kwargs:
-  # Keep roughly similar temporal receptive range as default (12 chunks x 3 frames ~= 36 frames)
-  local_attn_size: 36
+  local_attn_size: 12
   timestep_shift: 5.0
   sink_size: 3
   bank_size: 6
-  record_interval: 1
+  record_interval: 3
   SMA: true
   tcat_enabled: false
   tcat_sink_k: 1
@@ -43,12 +42,12 @@ spt_enabled: true
 spt:
   scheduler_type: adaptive
   base_scheduler: cosine
-  min_window: 6
-  max_window: 18
-  window_frames: 12
-  delay_frames: 2
+  min_window: 3
+  max_window: 15
+  window_frames: 9
+  delay_frames: 3
   steepness: 6.0
-  frames_per_chunk: 1
+  frames_per_chunk: 3
 
 # Continuity switch option
 keep_bank_on_spt_switch: true
