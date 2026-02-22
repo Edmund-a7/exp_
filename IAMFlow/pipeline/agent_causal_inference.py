@@ -88,6 +88,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         )
         self.min_scene_memory_frames = int(getattr(args, "min_scene_memory_frames", 1))
         self.scene_budget_token_threshold = int(getattr(args, "scene_budget_token_threshold", 4))
+        self.keep_bank_on_spt_switch = bool(getattr(args, "keep_bank_on_spt_switch", False))
 
         # 初始化 Memory Bank (使用父类的 text_encoder)
         self.agent_memory_bank = MemoryBank(
@@ -310,14 +311,18 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
                         )
                         scheduler.update_for_switch(dist)
                     self._soft_switch()
-                    # IAM: 即使不 recache，也需要清空 kv_bank 索引，避免沿用旧 prompt 的 memory
+                    # 连续场景可选择保留 bank，减少切段边界抖动；默认保持原行为。
                     if self.kv_bank1 is not None:
-                        for blk in self.kv_bank1:
-                            blk["local_end_index"].zero_()
-                            blk["global_end_index"].zero_()
-                        self._iam_bank_length = 0
-                        if DEBUG:
-                            print(f"[AgentPipeline] Reset kv_bank indices for prompt switch (SPT)")
+                        if self.keep_bank_on_spt_switch:
+                            if DEBUG:
+                                print("[AgentPipeline] keep_bank_on_spt_switch=True, keeping kv_bank indices")
+                        else:
+                            for blk in self.kv_bank1:
+                                blk["local_end_index"].zero_()
+                                blk["global_end_index"].zero_()
+                            self._iam_bank_length = 0
+                            if DEBUG:
+                                print(f"[AgentPipeline] Reset kv_bank indices for prompt switch (SPT)")
                 else:
                     # 重置 kv_cache 和 crossattn_cache（包含 kv_bank 索引重置）
                     self._recache_after_switch(output, current_start_frame, cond_list[segment_idx])

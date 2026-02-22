@@ -1,0 +1,79 @@
+# IAM Agent Inference Configuration (Continuity-focused)
+# Use this config when prompt transitions show spatial jumps.
+
+# Architecture
+denoising_step_list:
+  - 1000
+  - 750
+  - 500
+  - 250
+warp_denoising_step: true
+num_frame_per_block: 1
+model_name: Wan2.1-T2V-1.3B
+model_kwargs:
+  # Keep roughly similar temporal receptive range as default (12 chunks x 3 frames ~= 36 frames)
+  local_attn_size: 36
+  timestep_shift: 5.0
+  sink_size: 3
+  bank_size: 6
+  record_interval: 1
+  SMA: true
+  tcat_enabled: false
+  tcat_sink_k: 1
+  tcat_mem_k: 2
+  tcat_local_k: 3
+  tcat_local_near: 3
+  tcat_ema_alpha: 0.3
+
+# Inference
+data_path: prompts/interactive_example.jsonl
+output_folder: videos/iam_interactive_continuity
+inference_iter: -1
+num_output_frames: 240
+use_ema: false
+seed: 1
+num_samples: 1
+save_with_index: true
+switch_frame_indices: 40, 80, 120, 160, 200
+global_sink: true
+context_noise: 0
+
+# SPT: Soft Prompt Transition (wider window for smoother switching)
+spt_enabled: true
+spt:
+  scheduler_type: adaptive
+  base_scheduler: cosine
+  min_window: 6
+  max_window: 18
+  window_frames: 12
+  delay_frames: 2
+  steepness: 6.0
+  frames_per_chunk: 1
+
+# Continuity switch option
+keep_bank_on_spt_switch: true
+
+# Checkpoints
+generator_ckpt: checkpoints/base.pt
+lora_ckpt: checkpoints/lora.pt
+
+# LoRA Adapter
+adapter:
+  type: "lora"
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: "bfloat16"
+  verbose: false
+
+# IAM Agent Settings
+llm_model_path: ../Qwen3-0.6B
+max_memory_frames: 3
+save_dir: data/agent_frames
+use_vllm: true
+entity_memory_weight: 0.72
+scene_memory_weight: 0.28
+scene_skip_threshold: 0.22
+min_id_memory_frames_multi_entity: 2
+min_scene_memory_frames: 1
+scene_budget_token_threshold: 4

@@ -35,6 +35,17 @@ from pipeline.agent_causal_inference import AgentCausalInferencePipeline
 from utils.dataset import MultiTextDataset
 
 
+def _align_switch_indices(indices: List[int], block: int) -> List[int]:
+    """Align switch frames to block boundaries to avoid mid-block semantic jumps."""
+    if block <= 1:
+        return indices
+    aligned = []
+    for idx in indices:
+        snapped = (idx // block) * block
+        aligned.append(snapped)
+    return aligned
+
+
 # ----------------------------- Argument parsing -----------------------------
 parser = argparse.ArgumentParser("IAM Agent causal inference")
 parser.add_argument("--config_path", type=str, help="Path to the config file")
@@ -202,6 +213,14 @@ def main():
     # ----------------------------- Build dataset -----------------------------
     # Parse switch_frame_indices
     switch_frame_indices: List[int] = [int(x) for x in config.switch_frame_indices.split(",") if x.strip()]
+    block_size = int(getattr(config, "num_frame_per_block", 1))
+    aligned_switch_indices = _align_switch_indices(switch_frame_indices, block_size)
+    if aligned_switch_indices != switch_frame_indices and local_rank == 0:
+        print(
+            f"[Warning] switch_frame_indices {switch_frame_indices} are not aligned to "
+            f"num_frame_per_block={block_size}, using {aligned_switch_indices}."
+        )
+    switch_frame_indices = aligned_switch_indices
 
     # Create dataset
     dataset = MultiTextDataset(config.data_path)

@@ -49,6 +49,7 @@ spt:
   delay_frames: 3           # Delay before blending starts (1 chunk)
   steepness: 6.0            # Sigmoid scheduler only
   frames_per_chunk: 3       # Step scheduler only
+keep_bank_on_spt_switch: true  # 保留切换前记忆，减少边界帧跳变
 
 # Checkpoints
 generator_ckpt: checkpoints/base.pt
