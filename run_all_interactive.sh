@@ -34,6 +34,7 @@ OUTPUT_DIR="${PROJECT_ROOT}/benchmark_results/id_stress_test_batch_6"
 # INPUT_PROMPTS="${PROJECT_ROOT}/interactive_1_2.jsonl"
 # OUTPUT_DIR="${PROJECT_ROOT}/benchmark_results/interactive_1_2"
 SEED=42
+USE_LIGHTVAE=false  # 设为 true 启用 LightVAE (75% 通道剪枝)
 # ==============================================================
 
 export WAN_MODEL_PATH="${WAN_MODEL_PATH}"
@@ -120,6 +121,7 @@ CUDA_VISIBLE_DEVICES=0 python agent_interactive_inference.py \
     --lora_ckpt "${IAMFLOW_LORA}" \
     --llm_model_path "${QWEN_MODEL_PATH}" \
     --seed ${SEED} \
+    $( [ "${USE_LIGHTVAE}" = "true" ] && echo "--use_lightvae" ) \
     2>&1 | tee "${IAMFLOW_LOG}"
 
 echo "=========================================="

@@ -56,6 +56,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         save_frames_to_disk: bool = False,
         use_vllm: bool = True,
         gpu_memory_utilization: float = 0.2,
+        use_lightvae: bool = False,
     ):
         """
         初始化 Agent Pipeline
@@ -72,8 +73,9 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             save_frames_to_disk: 是否将帧 KV 保存到磁盘
             use_vllm: 是否使用 vLLM 加速 (默认True)
             gpu_memory_utilization: vLLM GPU 显存利用率 (默认0.2，低并发场景)
+            use_lightvae: 是否使用 LightVAE (75% 通道剪枝)
         """
-        super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae)
+        super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae, use_lightvae=use_lightvae)
 
         # 初始化 LLM Agent
         self.llm_agent = LLMAgent(model_path=llm_model_path, use_vllm=use_vllm,

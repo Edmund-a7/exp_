@@ -66,6 +66,8 @@ parser.add_argument("--mapping_path", type=str, default=None,
                     help="Path to save mapping.json (default: output_folder/mapping.json)")
 parser.add_argument("--save_frames_to_disk", action="store_true",
                     help="Save frame KV to disk (default: False, keep in memory only for better performance)")
+parser.add_argument("--use_lightvae", action="store_true",
+                    help="Use LightVAE (75%% channel pruning) instead of standard VAE")
 
 
 def main():
@@ -123,6 +125,7 @@ def main():
     save_dir = args.save_dir if args.save_dir != "data/agent_frames" else getattr(config, "save_dir", "data/agent_frames")
     save_frames_to_disk = args.save_frames_to_disk or getattr(config, "save_frames_to_disk", False)
     use_vllm = getattr(config, "use_vllm", True)  # 默认使用 vLLM
+    use_lightvae = args.use_lightvae or getattr(config, "use_lightvae", False)
 
     if local_rank == 0:
         print("=" * 60)
@@ -133,6 +136,7 @@ def main():
         print(f"Save Directory: {save_dir}")
         print(f"Save Frames to Disk: {save_frames_to_disk}")
         print(f"Use vLLM: {use_vllm}")
+        print(f"Use LightVAE: {use_lightvae}")
         print("=" * 60)
 
     pipeline = AgentCausalInferencePipeline(
@@ -142,7 +146,8 @@ def main():
         max_memory_frames=max_memory_frames,
         save_dir=save_dir,
         save_frames_to_disk=save_frames_to_disk,
-        use_vllm=use_vllm
+        use_vllm=use_vllm,
+        use_lightvae=use_lightvae,
     )
 
     # ----------------------------- Load base checkpoint -----------------------------

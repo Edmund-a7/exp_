@@ -17,7 +17,8 @@ class CausalInferencePipeline(torch.nn.Module):
             device,
             generator=None,
             text_encoder=None,
-            vae=None
+            vae=None,
+            use_lightvae=False,
     ):
         super().__init__()
         # Step 1: Initialize all models
@@ -26,7 +27,7 @@ class CausalInferencePipeline(torch.nn.Module):
         self.generator = WanDiffusionWrapper(
             **getattr(args, "model_kwargs", {}), is_causal=True) if generator is None else generator
         self.text_encoder = WanTextEncoder() if text_encoder is None else text_encoder
-        self.vae = WanVAEWrapper() if vae is None else vae
+        self.vae = WanVAEWrapper(use_lightvae=use_lightvae) if vae is None else vae
 
         # Step 2: Initialize all causal hyperparmeters
         self.scheduler = self.generator.get_scheduler()
