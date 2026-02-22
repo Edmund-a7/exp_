@@ -1,5 +1,5 @@
-# IAM Agent Inference Configuration (Continuity-focused)
-# Use this config when prompt transitions show spatial jumps.
+# IAM Agent Inference Configuration (ID-only memory)
+# Scene memory is disabled for single-scene benchmark validation.
 
 # Architecture
 denoising_step_list:
@@ -26,7 +26,7 @@ model_kwargs:
 
 # Inference
 data_path: prompts/interactive_example.jsonl
-output_folder: videos/iam_interactive_continuity
+output_folder: videos/iam_interactive_id_only
 inference_iter: -1
 num_output_frames: 240
 use_ema: false
@@ -37,7 +37,7 @@ switch_frame_indices: 40, 80, 120, 160, 200
 global_sink: true
 context_noise: 0
 
-# SPT: Soft Prompt Transition (wider window for smoother switching)
+# SPT
 spt_enabled: true
 spt:
   scheduler_type: adaptive
@@ -49,7 +49,7 @@ spt:
   steepness: 6.0
   frames_per_chunk: 3
 
-# Continuity switch option
+# Continuity options
 keep_bank_on_spt_switch: true
 
 # Checkpoints
@@ -70,9 +70,9 @@ llm_model_path: ../Qwen3-0.6B
 max_memory_frames: 3
 save_dir: data/agent_frames
 use_vllm: true
-enable_scene_memory: true  # false 时只使用 id-memory
-entity_memory_weight: 0.72
-scene_memory_weight: 0.28
+enable_scene_memory: false
+entity_memory_weight: 1.0
+scene_memory_weight: 0.0
 scene_skip_threshold: 0.22
 min_id_memory_frames_multi_entity: 2
 min_scene_memory_frames: 1

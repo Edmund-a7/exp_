@@ -68,6 +68,7 @@ class MemoryBank:
                  max_memory_frames: int = 3,
                  max_id_memory_frames: int = 4,
                  max_scene_memory_frames: int = 2,
+                 enable_scene_memory: bool = True,
                  min_id_memory_frames_multi_entity: int = 2,
                  min_scene_memory_frames: int = 1,
                  scene_budget_token_threshold: int = 4,
@@ -85,6 +86,7 @@ class MemoryBank:
             max_memory_frames: 最大记忆帧数量 (向后兼容，仅在未启用双层记忆时使用)
             max_id_memory_frames: ID Memory 最大帧数 (entity 驱动，1~4 帧)
             max_scene_memory_frames: Scene Memory 最大帧数 (scene 驱动，1~2 帧)
+            enable_scene_memory: 是否启用 scene memory 路径（False 时退化为纯 id-memory）
             min_id_memory_frames_multi_entity: 多实体时 ID Memory 最小帧数
             min_scene_memory_frames: Scene Memory 最小帧数
             scene_budget_token_threshold: scene token 数达到该阈值时使用 max_scene_memory_frames
@@ -98,20 +100,27 @@ class MemoryBank:
         self.text_encoder = text_encoder
         self.max_memory_frames = max_memory_frames
         self.max_id_memory_frames = max_id_memory_frames
-        self.max_scene_memory_frames = max_scene_memory_frames
+        self.enable_scene_memory = bool(enable_scene_memory)
+        self.max_scene_memory_frames = max_scene_memory_frames if self.enable_scene_memory else 0
         self.min_id_memory_frames_multi_entity = max(
             1,
             min(min_id_memory_frames_multi_entity, self.max_id_memory_frames),
         )
-        self.min_scene_memory_frames = max(
-            1,
-            min(min_scene_memory_frames, self.max_scene_memory_frames),
-        )
-        self.scene_budget_token_threshold = max(1, int(scene_budget_token_threshold))
-        self.entity_memory_weight, self.scene_memory_weight = self._normalize_path_weights(
-            entity_memory_weight,
-            scene_memory_weight,
-        )
+        if self.enable_scene_memory:
+            self.min_scene_memory_frames = max(
+                1,
+                min(min_scene_memory_frames, self.max_scene_memory_frames),
+            )
+            self.scene_budget_token_threshold = max(1, int(scene_budget_token_threshold))
+            self.entity_memory_weight, self.scene_memory_weight = self._normalize_path_weights(
+                entity_memory_weight,
+                scene_memory_weight,
+            )
+        else:
+            self.min_scene_memory_frames = 0
+            self.scene_budget_token_threshold = 0
+            # ID-only mode: 强制禁用 scene 路径融合权重
+            self.entity_memory_weight, self.scene_memory_weight = 1.0, 0.0
         self.frame_seq_length = frame_seq_length
         self.num_transformer_blocks = num_transformer_blocks
         self.save_dir = save_dir
@@ -134,6 +143,8 @@ class MemoryBank:
     @property
     def frame_active_memory(self) -> List[str]:
         """向后兼容属性: 返回 id_memory + scene_memory 的去重合并"""
+        if not self.enable_scene_memory:
+            return list(dict.fromkeys(self.id_memory))
         return list(dict.fromkeys(self.id_memory + self.scene_memory))
 
     @staticmethod
@@ -375,7 +386,7 @@ class MemoryBank:
             print(f"[DEBUG] retrieve_initial_frames: no entities, id_memory=[]")
 
         # === Scene Memory 路径: 按 scene_score ===
-        if scene_texts:
+        if self.enable_scene_memory and scene_texts:
             scene_budget = self._compute_dynamic_scene_budget(scene_texts)
             scene_candidates = []
             for fid, fi in self.frame_archive.items():
@@ -439,7 +450,10 @@ class MemoryBank:
             import warnings
             warnings.warn("[MemoryBank] crossattn_cache not initialized, selecting first frame by default")
             entity_scores = torch.ones(num_candidate_frames, device=device, dtype=dtype)
-            scene_scores = torch.ones(num_candidate_frames, device=device, dtype=dtype)
+            if self.enable_scene_memory:
+                scene_scores = torch.ones(num_candidate_frames, device=device, dtype=dtype)
+            else:
+                scene_scores = torch.zeros(num_candidate_frames, device=device, dtype=dtype)
         else:
             num_text_tokens = crossattn_cache[0]["k"].shape[1]
 
@@ -453,7 +467,7 @@ class MemoryBank:
             )
 
             # 2. Scene 路径: scene text token 权重打分
-            if scene_texts:
+            if self.enable_scene_memory and scene_texts:
                 scene_weights = self._build_scene_token_weights(
                     scene_texts, num_text_tokens, prompt_text, current_entities
                 )
@@ -1039,7 +1053,7 @@ class MemoryBank:
         - token 数 < scene_budget_token_threshold: min_scene_memory_frames
         - token 数 >= scene_budget_token_threshold: max_scene_memory_frames
         """
-        if not scene_texts:
+        if (not self.enable_scene_memory) or (not scene_texts):
             return 0
 
         _, scene_tokens = self._normalize_scene_texts(scene_texts)
@@ -1155,7 +1169,7 @@ class MemoryBank:
             frame_id: 新帧ID
             scene_score: scene 维度分数
         """
-        if frame_id not in self.frame_archive:
+        if (not self.enable_scene_memory) or frame_id not in self.frame_archive:
             return
 
         if len(self.scene_memory) < self.max_scene_memory_frames:

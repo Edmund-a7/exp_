@@ -69,6 +69,7 @@ llm_model_path: ../Qwen3-0.6B
 max_memory_frames: 3
 save_dir: data/agent_frames
 use_vllm: true  # 使用 vLLM 加速 LLM 推理 (需要安装 vllm)
+enable_scene_memory: true  # false 时只使用 id-memory
 entity_memory_weight: 0.72
 scene_memory_weight: 0.28
 scene_skip_threshold: 0.22

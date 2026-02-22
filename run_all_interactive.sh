@@ -20,6 +20,9 @@ MEMFLOW_BASE="${PROJECT_ROOT}/IAMFlow/checkpoints/base.pt"
 MEMFLOW_LORA="${PROJECT_ROOT}/IAMFlow/checkpoints/lora.pt"
 IAMFLOW_BASE="${PROJECT_ROOT}/IAMFlow/checkpoints/base.pt"
 IAMFLOW_LORA="${PROJECT_ROOT}/IAMFlow/checkpoints/lora.pt"
+IAMFLOW_CONFIG="${PROJECT_ROOT}/IAMFlow/configs/agent_interactive_inference_continuity.yaml"
+# 只测 id-memory 时改为:
+# IAMFLOW_CONFIG="${PROJECT_ROOT}/IAMFlow/configs/agent_interactive_inference_id_only.yaml"
 
 # Input / Output
 # INPUT_PROMPTS="${PROJECT_ROOT}/memflow_benchmark.jsonl"
@@ -72,6 +75,10 @@ if [ ! -d "${QWEN_MODEL_PATH}" ]; then
     echo "[ERROR] QWEN_MODEL_PATH not found: ${QWEN_MODEL_PATH}"
     exit 1
 fi
+if [ ! -f "${IAMFLOW_CONFIG}" ]; then
+    echo "[ERROR] IAMFLOW_CONFIG not found: ${IAMFLOW_CONFIG}"
+    exit 1
+fi
 
 # # LongLive
 # echo "[1/3] Running LongLive..."
@@ -106,7 +113,7 @@ echo "[3/3] Running IAMFlow..."
 echo "Log: ${IAMFLOW_LOG}"
 cd "${PROJECT_ROOT}/IAMFlow"
 CUDA_VISIBLE_DEVICES=0 python agent_interactive_inference.py \
-    --config_path configs/agent_interactive_inference_continuity.yaml \
+    --config_path "${IAMFLOW_CONFIG}" \
     --data_path "${INPUT_PROMPTS}" \
     --output_folder "${OUTPUT_DIR}/iamflow" \
     --generator_ckpt "${IAMFLOW_BASE}" \

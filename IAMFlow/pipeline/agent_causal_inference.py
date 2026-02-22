@@ -82,6 +82,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         # 双路融合与场景跳过配置（可在 YAML 顶层覆盖）
         self.entity_memory_weight = float(getattr(args, "entity_memory_weight", 0.6))
         self.scene_memory_weight = float(getattr(args, "scene_memory_weight", 0.4))
+        self.enable_scene_memory = bool(getattr(args, "enable_scene_memory", True))
         self.scene_skip_threshold = float(getattr(args, "scene_skip_threshold", 0.3))
         self.min_id_memory_frames_multi_entity = int(
             getattr(args, "min_id_memory_frames_multi_entity", 2)
@@ -94,6 +95,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         self.agent_memory_bank = MemoryBank(
             text_encoder=self.text_encoder,
             max_memory_frames=max_memory_frames,
+            enable_scene_memory=self.enable_scene_memory,
             min_id_memory_frames_multi_entity=self.min_id_memory_frames_multi_entity,
             min_scene_memory_frames=self.min_scene_memory_frames,
             scene_budget_token_threshold=self.scene_budget_token_threshold,
@@ -106,8 +108,10 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         )
 
         # Phase 3: bank_size 需要容纳双层记忆的最大帧数 (id=4 + scene=2 = 6)
-        dual_memory_max = (self.agent_memory_bank.max_id_memory_frames
-                           + self.agent_memory_bank.max_scene_memory_frames)
+        dual_memory_max = (
+            self.agent_memory_bank.max_id_memory_frames
+            + self.agent_memory_bank.max_scene_memory_frames
+        )
         if self.bank_size < dual_memory_max:
             self.bank_size = dual_memory_max
 
@@ -656,12 +660,15 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         )
 
         self.current_entities = entities
-        self.current_scene_texts = scene_texts
+        if self.enable_scene_memory:
+            self.current_scene_texts = scene_texts
+        else:
+            self.current_scene_texts = []
 
         print(f"[DEBUG] Extracted {len(entities)} entities:")
         for e in entities:
             print(f"  - entity='{e.entity}', global_id={e.global_id}, attrs={e.attrs}")
-        print(f"[DEBUG] Extracted scene: {scene_texts}")
+        print(f"[DEBUG] Extracted scene: {self.current_scene_texts}")
 
         print(f"[DEBUG] Registry update: {list(registry_update.keys()) if registry_update else 'None'}")
 
@@ -676,29 +683,42 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         print(f"[DEBUG] Global registry after update: {list(self.agent_memory_bank.global_registry.keys())}")
 
         # 3. 检索初始记忆帧 (非首个 prompt) — 双路检索 + 同场景跳过
-        if not is_first_prompt and (entities or scene_texts):
+        if not is_first_prompt and (entities or self.current_scene_texts):
             entity_ids = self.agent_memory_bank.get_entity_ids(entities) if entities else []
 
             # Phase 3: 同场景跳过 — 场景未变时保留 scene_memory，只更新 id_memory
             skip_scene = False
-            if self.prev_scene_texts and scene_texts:
-                scene_dist = self._compute_scene_distance(self.prev_scene_texts, scene_texts)
+            if self.enable_scene_memory and self.prev_scene_texts and self.current_scene_texts:
+                scene_dist = self._compute_scene_distance(
+                    self.prev_scene_texts, self.current_scene_texts
+                )
                 if scene_dist <= self.scene_skip_threshold:
                     skip_scene = True
-                    print(f"[DEBUG] Scene unchanged (dist={scene_dist:.3f} <= {self.scene_skip_threshold}), skipping scene retrieval")
+                    print(
+                        f"[DEBUG] Scene unchanged (dist={scene_dist:.3f} <= {self.scene_skip_threshold}), skipping scene retrieval"
+                    )
                 else:
-                    print(f"[DEBUG] Scene changed (dist={scene_dist:.3f} > {self.scene_skip_threshold}), re-retrieving scene memory")
+                    print(
+                        f"[DEBUG] Scene changed (dist={scene_dist:.3f} > {self.scene_skip_threshold}), re-retrieving scene memory"
+                    )
 
-            print(f"[DEBUG] Retrieving initial frames for entity_ids: {entity_ids}, scene_texts: {scene_texts}, skip_scene={skip_scene}")
-            retrieve_scene = None if skip_scene else scene_texts
-            old_scene_memory = self.agent_memory_bank.scene_memory.copy() if skip_scene else []
+            print(
+                f"[DEBUG] Retrieving initial frames for entity_ids: {entity_ids}, "
+                f"scene_texts: {self.current_scene_texts}, skip_scene={skip_scene}"
+            )
+            retrieve_scene = None if (skip_scene or not self.enable_scene_memory) else self.current_scene_texts
+            old_scene_memory = (
+                self.agent_memory_bank.scene_memory.copy()
+                if (skip_scene and self.enable_scene_memory)
+                else []
+            )
 
             retrieved_frames = self.agent_memory_bank.retrieve_initial_frames(
                 entity_ids, scene_texts=retrieve_scene
             )
 
             # 恢复被跳过的 scene_memory
-            if skip_scene:
+            if skip_scene and self.enable_scene_memory:
                 self.agent_memory_bank.scene_memory = old_scene_memory
 
             print(f"[DEBUG] Retrieved initial frames: {self.agent_memory_bank.frame_active_memory}")
@@ -712,7 +732,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             print(f"[DEBUG] Injected memory frames to kv_bank")
 
         # Phase 3: 更新 prev_scene_texts
-        self.prev_scene_texts = scene_texts
+        self.prev_scene_texts = self.current_scene_texts if self.enable_scene_memory else []
 
     def _process_chunk_eviction(self,
                                 current_start_frame: int,
@@ -755,7 +775,8 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         # 双路更新: 分别更新 id_memory 和 scene_memory
         frame_info = self.agent_memory_bank.frame_archive[frame_id]
         self.agent_memory_bank.update_id_memory(frame_id, frame_info.entity_score)
-        self.agent_memory_bank.update_scene_memory(frame_id, frame_info.scene_score)
+        if self.enable_scene_memory:
+            self.agent_memory_bank.update_scene_memory(frame_id, frame_info.scene_score)
 
         print(f"[DEBUG] id_memory={self.agent_memory_bank.id_memory}")
         print(f"[DEBUG] scene_memory={self.agent_memory_bank.scene_memory}")
