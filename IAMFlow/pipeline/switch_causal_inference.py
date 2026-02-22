@@ -27,8 +27,9 @@ class SwitchCausalInferencePipeline(CausalInferencePipeline):
         generator: WanDiffusionWrapper | None = None,
         text_encoder: WanTextEncoder | None = None,
         vae: WanVAEWrapper | None = None,
+        use_lightvae: bool = False,
     ):
-        super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae)
+        super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae, use_lightvae=use_lightvae)
         self.global_sink = getattr(args, "global_sink", False)
 
     # Internal helpers
