@@ -62,7 +62,7 @@ class WanTextEncoder(torch.nn.Module):
 
 
 class WanVAEWrapper(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, use_lightvae=False, vae_path=None):
         super().__init__()
         mean = [
             -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
@@ -75,10 +75,18 @@ class WanVAEWrapper(torch.nn.Module):
         self.mean = torch.tensor(mean, dtype=torch.float32)
         self.std = torch.tensor(std, dtype=torch.float32)
 
+        if use_lightvae:
+            pruning_rate = 0.75
+            vae_path = vae_path or f"{WAN_MODEL_PATH}/lightvaew2_1.pth"
+        else:
+            pruning_rate = 0.0
+            vae_path = vae_path or f"{WAN_MODEL_PATH}/Wan2.1_VAE.pth"
+
         # init model
         self.model = _video_vae(
-            pretrained_path=f"{WAN_MODEL_PATH}/Wan2.1_VAE.pth",
+            pretrained_path=vae_path,
             z_dim=16,
+            pruning_rate=pruning_rate,
         ).eval().requires_grad_(False)
 
     def encode_to_latent(self, pixel: torch.Tensor) -> torch.Tensor:

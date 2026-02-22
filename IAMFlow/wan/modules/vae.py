@@ -271,7 +271,8 @@ class Encoder3d(nn.Module):
                  num_res_blocks=2,
                  attn_scales=[],
                  temperal_downsample=[True, True, False],
-                 dropout=0.0):
+                 dropout=0.0,
+                 pruning_rate=0.0):
         super().__init__()
         self.dim = dim
         self.z_dim = z_dim
@@ -282,6 +283,7 @@ class Encoder3d(nn.Module):
 
         # dimensions
         dims = [dim * u for u in [1] + dim_mult]
+        dims = [int(d * (1 - pruning_rate)) for d in dims]
         scale = 1.0
 
         # init block
@@ -375,7 +377,8 @@ class Decoder3d(nn.Module):
                  num_res_blocks=2,
                  attn_scales=[],
                  temperal_upsample=[False, True, True],
-                 dropout=0.0):
+                 dropout=0.0,
+                 pruning_rate=0.0):
         super().__init__()
         self.dim = dim
         self.z_dim = z_dim
@@ -386,6 +389,7 @@ class Decoder3d(nn.Module):
 
         # dimensions
         dims = [dim * u for u in [dim_mult[-1]] + dim_mult[::-1]]
+        dims = [int(d * (1 - pruning_rate)) for d in dims]
         scale = 1.0 / 2**(len(dim_mult) - 2)
 
         # init block
@@ -489,7 +493,8 @@ class WanVAE_(nn.Module):
                  num_res_blocks=2,
                  attn_scales=[],
                  temperal_downsample=[True, True, False],
-                 dropout=0.0):
+                 dropout=0.0,
+                 pruning_rate=0.0):
         super().__init__()
         self.dim = dim
         self.z_dim = z_dim
@@ -501,11 +506,13 @@ class WanVAE_(nn.Module):
 
         # modules
         self.encoder = Encoder3d(dim, z_dim * 2, dim_mult, num_res_blocks,
-                                 attn_scales, self.temperal_downsample, dropout)
+                                 attn_scales, self.temperal_downsample, dropout,
+                                 pruning_rate=pruning_rate)
         self.conv1 = CausalConv3d(z_dim * 2, z_dim * 2, 1)
         self.conv2 = CausalConv3d(z_dim, z_dim, 1)
         self.decoder = Decoder3d(dim, z_dim, dim_mult, num_res_blocks,
-                                 attn_scales, self.temperal_upsample, dropout)
+                                 attn_scales, self.temperal_upsample, dropout,
+                                 pruning_rate=pruning_rate)
         self.clear_cache()
 
     def forward(self, x):
@@ -621,7 +628,8 @@ def _video_vae(pretrained_path=None, z_dim=None, device='cpu', **kwargs):
         num_res_blocks=2,
         attn_scales=[],
         temperal_downsample=[False, True, True],
-        dropout=0.0)
+        dropout=0.0,
+        pruning_rate=0.0)
     cfg.update(**kwargs)
 
     # init model
@@ -642,7 +650,8 @@ class WanVAE:
                  z_dim=16,
                  vae_pth='cache/vae_step_411000.pth',
                  dtype=torch.float,
-                 device="cuda"):
+                 device="cuda",
+                 use_lightvae=False):
         self.dtype = dtype
         self.device = device
 
@@ -662,6 +671,7 @@ class WanVAE:
         self.model = _video_vae(
             pretrained_path=vae_pth,
             z_dim=z_dim,
+            pruning_rate=0.75 if use_lightvae else 0.0,
         ).eval().requires_grad_(False).to(device)
 
     def encode(self, videos):
