@@ -187,16 +187,8 @@ def select_top_blocks_shared(
     key = key[:, :valid_tokens]
     value = value[:, :valid_tokens]
 
-    block_spans: List[Tuple[int, int]] = []
-    for frame_idx in range(num_frames):
-        frame_base = frame_idx * frame_tokens
-        offset = 0
-        while offset < frame_tokens:
-            end = min(offset + block_size, frame_tokens)
-            block_spans.append((frame_base + offset, frame_base + end))
-            offset = end
-
-    num_blocks = len(block_spans)
+    blocks_per_frame = int(math.ceil(frame_tokens / block_size))
+    num_blocks = num_frames * blocks_per_frame
     if num_blocks == 0:
         return key[:, :0], value[:, :0], []
 
@@ -207,23 +199,56 @@ def select_top_blocks_shared(
         k_blocks = min(k_blocks, int(max_blocks))
     k_blocks = min(k_blocks, num_blocks)
 
-    # Shared query descriptor over tokens/heads.
+    # Vectorized block scoring:
+    # [B, F*T, H, D] -> [B, F, T, H, D] -> pad per frame -> [B, F, BP, BS, H, D].
+    B, _, H, D = key.shape
+    key_frames = key.view(B, num_frames, frame_tokens, H, D)
+
+    padded_tokens_per_frame = blocks_per_frame * block_size
+    if padded_tokens_per_frame > frame_tokens:
+        pad_tokens = padded_tokens_per_frame - frame_tokens
+        key_pad = torch.zeros(
+            (B, num_frames, pad_tokens, H, D),
+            device=key.device,
+            dtype=key.dtype,
+        )
+        key_frames = torch.cat([key_frames, key_pad], dim=2)
+
+    key_blocks = key_frames.view(B, num_frames, blocks_per_frame, block_size, H, D)
+
+    # Tail block has fewer valid tokens. Normalize by valid lengths per block.
+    block_lengths = torch.full(
+        (blocks_per_frame,),
+        float(block_size),
+        device=key.device,
+        dtype=torch.float32,
+    )
+    tail_tokens = frame_tokens - (blocks_per_frame - 1) * block_size
+    block_lengths[-1] = float(tail_tokens)
+
+    # Aggregate over token/head -> [B, F, BP, D]
+    key_block_sum = key_blocks.sum(dim=3).sum(dim=3)
+    denom = block_lengths.view(1, 1, blocks_per_frame, 1) * float(H)
+    key_block_desc = key_block_sum / denom.to(dtype=key_block_sum.dtype)
+    key_block_desc = key_block_desc.reshape(B, num_blocks, D)
+
+    # Shared query descriptor and dot-product scores -> [num_blocks]
     q_desc = query.mean(dim=1).mean(dim=1)  # [B, D]
-    scores = []
-    for start, end in block_spans:
-        block_desc = key[:, start:end].mean(dim=1).mean(dim=1)  # [B, D]
-        score = (q_desc * block_desc).sum(dim=-1).mean()
-        scores.append(score)
-    score_tensor = torch.stack(scores, dim=0)  # [num_blocks]
+    score_tensor = (q_desc.unsqueeze(1) * key_block_desc).sum(dim=-1).mean(dim=0)
 
     top_idx = torch.topk(score_tensor, k=k_blocks).indices
     top_idx, _ = torch.sort(top_idx)
     selected_idx = top_idx.tolist()
 
+    # Gather selected blocks from original (un-padded) 1-D sequence.
     k_parts = []
     v_parts = []
     for idx in selected_idx:
-        start, end = block_spans[idx]
+        frame_idx = idx // blocks_per_frame
+        block_idx = idx % blocks_per_frame
+        frame_base = frame_idx * frame_tokens
+        start = frame_base + block_idx * block_size
+        end = min(start + block_size, frame_base + frame_tokens)
         k_parts.append(key[:, start:end])
         v_parts.append(value[:, start:end])
 
