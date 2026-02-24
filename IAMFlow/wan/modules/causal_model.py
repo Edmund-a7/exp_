@@ -10,6 +10,13 @@ from wan.modules.model import (
     MLPProj,
     sinusoidal_embedding_1d
 )
+from wan.modules.hsa_utils import (
+    compute_frame_scores_shared,
+    gather_frames_by_indices,
+    select_frame_indices_with_quota,
+    split_local_far_near,
+    select_top_blocks_shared,
+)
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from torch.nn.attention.flex_attention import BlockMask
@@ -80,7 +87,17 @@ class CausalWanSelfAttention(nn.Module):
                  tcat_mem_k=2,
                  tcat_local_k=3,
                  tcat_local_near=3,  # v2: preserve last N chunks of Local
-                 tcat_ema_alpha=0.3):
+                 tcat_ema_alpha=0.3,
+                 # HSA parameters
+                 hsa_enabled=False,
+                 hsa_frame_top_k=2,
+                 hsa_frame_min_sink=1,
+                 hsa_frame_min_mem=1,
+                 hsa_local_far_frames=6,
+                 hsa_local_near_frames=3,
+                 hsa_block_size=64,
+                 hsa_block_keep_ratio=0.35,
+                 hsa_block_min_blocks=1):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -100,6 +117,16 @@ class CausalWanSelfAttention(nn.Module):
         self.tcat_local_k = tcat_local_k
         self.tcat_local_near = tcat_local_near  # v2: preserve last N chunks
         self.tcat_ema_alpha = tcat_ema_alpha
+        # HSA parameters
+        self.hsa_enabled = hsa_enabled
+        self.hsa_frame_top_k = hsa_frame_top_k
+        self.hsa_frame_min_sink = hsa_frame_min_sink
+        self.hsa_frame_min_mem = hsa_frame_min_mem
+        self.hsa_local_far_frames = hsa_local_far_frames
+        self.hsa_local_near_frames = hsa_local_near_frames
+        self.hsa_block_size = hsa_block_size
+        self.hsa_block_keep_ratio = hsa_block_keep_ratio
+        self.hsa_block_min_blocks = hsa_block_min_blocks
         # TCAT EMA state (per region)
         self.tcat_prev_scores_sink = None
         self.tcat_prev_scores_mem = None
@@ -656,8 +683,87 @@ class CausalWanSelfAttention(nn.Module):
                     k_bank = bank_k[:, :local_end_index_bank_]
                     v_bank = bank_v[:, :local_end_index_bank_]
 
+                    # HSA: Hierarchical Sparse Attention
+                    # First chunk (current_start == 0) stays dense for stability.
+                    if self.hsa_enabled and current_start > 0:
+                        frame_tokens = frame_seqlen
+                        if k_sink.shape[1] >= frame_tokens:
+                            k_sink_fixed = k_sink[:, :frame_tokens]
+                            v_sink_fixed = v_sink[:, :frame_tokens]
+                            k_sink_tail = k_sink[:, frame_tokens:]
+                            v_sink_tail = v_sink[:, frame_tokens:]
+                        else:
+                            k_sink_fixed = k_sink
+                            v_sink_fixed = v_sink
+                            k_sink_tail = k_sink[:, :0]
+                            v_sink_tail = v_sink[:, :0]
+
+                        # Frame-level selection:
+                        # keep sink first frame, then select top-2 from sink tail + memory with quotas.
+                        sink_scores = compute_frame_scores_shared(
+                            query=roped_query,
+                            key=k_sink_tail,
+                            frame_tokens=frame_tokens,
+                        )
+                        mem_scores = compute_frame_scores_shared(
+                            query=roped_query,
+                            key=k_bank,
+                            frame_tokens=frame_tokens,
+                        )
+                        sink_idx, mem_idx = select_frame_indices_with_quota(
+                            sink_scores=sink_scores,
+                            mem_scores=mem_scores,
+                            top_k=self.hsa_frame_top_k,
+                            min_sink=self.hsa_frame_min_sink,
+                            min_mem=self.hsa_frame_min_mem,
+                        )
+                        k_sink_sel, v_sink_sel = gather_frames_by_indices(
+                            key=k_sink_tail,
+                            value=v_sink_tail,
+                            frame_indices=sink_idx,
+                            frame_tokens=frame_tokens,
+                        )
+                        k_mem_sel, v_mem_sel = gather_frames_by_indices(
+                            key=k_bank,
+                            value=v_bank,
+                            frame_indices=mem_idx,
+                            frame_tokens=frame_tokens,
+                        )
+                        k_selected_frames = torch.cat([k_sink_fixed, k_sink_sel, k_mem_sel], dim=1)
+                        v_selected_frames = torch.cat([v_sink_fixed, v_sink_sel, v_mem_sel], dim=1)
+
+                        # Local split: first 6 frames = local-far (sparse), last 3 frames = local-near (always keep).
+                        k_local_far, v_local_far, k_local_near, v_local_near = split_local_far_near(
+                            k_local=k_local,
+                            v_local=v_local,
+                            frame_tokens=frame_tokens,
+                            far_frames=self.hsa_local_far_frames,
+                            near_frames=self.hsa_local_near_frames,
+                        )
+
+                        # Block-level selection on [selected 3 frames + local-far].
+                        k_sparse_pool = torch.cat([k_selected_frames, k_local_far], dim=1)
+                        v_sparse_pool = torch.cat([v_selected_frames, v_local_far], dim=1)
+                        k_sparse, v_sparse, _ = select_top_blocks_shared(
+                            query=roped_query,
+                            key=k_sparse_pool,
+                            value=v_sparse_pool,
+                            frame_tokens=frame_tokens,
+                            block_size=self.hsa_block_size,
+                            keep_ratio=self.hsa_block_keep_ratio,
+                            min_blocks=self.hsa_block_min_blocks,
+                        )
+
+                        # Append local-near as dense safeguard.
+                        k_cat = torch.cat([k_sparse, k_local_near], dim=1)
+                        v_cat = torch.cat([v_sparse, v_local_near], dim=1)
+
+                        # Guardrail: avoid empty KV in extreme sparse settings.
+                        if k_cat.shape[1] == 0:
+                            k_cat = torch.cat([k_sink, k_bank, k_local], dim=1)
+                            v_cat = torch.cat([v_sink, v_bank, v_local], dim=1)
                     # TCAT: Temporal Coverage Aware Top-k (per-region selection)
-                    if self.tcat_enabled:
+                    elif self.tcat_enabled:
                         k_cat, v_cat = self.tcat_routing_attention(
                             query=roped_query,
                             k_sink=k_sink,
@@ -739,7 +845,17 @@ class CausalWanAttentionBlock(nn.Module):
                  tcat_mem_k=2,
                  tcat_local_k=3,
                  tcat_local_near=3,
-                 tcat_ema_alpha=0.3):
+                 tcat_ema_alpha=0.3,
+                 # HSA parameters
+                 hsa_enabled=False,
+                 hsa_frame_top_k=2,
+                 hsa_frame_min_sink=1,
+                 hsa_frame_min_mem=1,
+                 hsa_local_far_frames=6,
+                 hsa_local_near_frames=3,
+                 hsa_block_size=64,
+                 hsa_block_keep_ratio=0.35,
+                 hsa_block_min_blocks=1):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -754,7 +870,10 @@ class CausalWanAttentionBlock(nn.Module):
         self.self_attn = CausalWanSelfAttention(
             dim, num_heads, local_attn_size, sink_size, qk_norm, eps,
             record_interval, SMA, sparse_top_k,
-            tcat_enabled, tcat_sink_k, tcat_mem_k, tcat_local_k, tcat_local_near, tcat_ema_alpha
+            tcat_enabled, tcat_sink_k, tcat_mem_k, tcat_local_k, tcat_local_near, tcat_ema_alpha,
+            hsa_enabled, hsa_frame_top_k, hsa_frame_min_sink, hsa_frame_min_mem,
+            hsa_local_far_frames, hsa_local_near_frames, hsa_block_size,
+            hsa_block_keep_ratio, hsa_block_min_blocks
         )
         self.norm3 = WanLayerNorm(
             dim, eps,
@@ -919,6 +1038,16 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  tcat_local_k=3,
                  tcat_local_near=3,
                  tcat_ema_alpha=0.3,
+                 # HSA parameters
+                 hsa_enabled=False,
+                 hsa_frame_top_k=2,
+                 hsa_frame_min_sink=1,
+                 hsa_frame_min_mem=1,
+                 hsa_local_far_frames=6,
+                 hsa_local_near_frames=3,
+                 hsa_block_size=64,
+                 hsa_block_keep_ratio=0.35,
+                 hsa_block_min_blocks=1,
                  qk_norm=True,
                  cross_attn_norm=True,
                  eps=1e-6):
@@ -1000,7 +1129,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 cross_attn_type, dim, ffn_dim, num_heads,
                 local_attn_size, sink_size, bank_size, qk_norm, cross_attn_norm, eps,
                 record_interval, SMA, sparse_top_k,
-                tcat_enabled, tcat_sink_k, tcat_mem_k, tcat_local_k, tcat_local_near, tcat_ema_alpha
+                tcat_enabled, tcat_sink_k, tcat_mem_k, tcat_local_k, tcat_local_near, tcat_ema_alpha,
+                hsa_enabled, hsa_frame_top_k, hsa_frame_min_sink, hsa_frame_min_mem,
+                hsa_local_far_frames, hsa_local_near_frames, hsa_block_size,
+                hsa_block_keep_ratio, hsa_block_min_blocks
             )
             for _ in range(num_layers)
         ])

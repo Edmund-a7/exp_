@@ -23,6 +23,16 @@ model_kwargs:
   tcat_local_k: 3
   tcat_local_near: 3
   tcat_ema_alpha: 0.3
+  # HSA: hierarchical sparse attention (sink+memory frame top-k + block top-k_b)
+  hsa_enabled: false
+  hsa_frame_top_k: 2
+  hsa_frame_min_sink: 1
+  hsa_frame_min_mem: 1
+  hsa_local_far_frames: 6
+  hsa_local_near_frames: 3
+  hsa_block_size: 64
+  hsa_block_keep_ratio: 0.35
+  hsa_block_min_blocks: 1
 
 # Inference
 data_path: prompts/interactive_example.jsonl
