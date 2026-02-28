@@ -34,8 +34,6 @@ class FrameInfo:
     associated_entities: List[str]  # global_id列表
     score: float                    # 综合分数 (向后兼容)
     entity_score: float = 0.0      # entity 维度分数
-    scene_score: float = 0.0       # scene 维度分数
-    scene_texts: List[str] = field(default_factory=list)  # 该帧对应 prompt 的场景文本
     # 存储所有 transformer block 的 KV cache
     # List[Dict[str, torch.Tensor]] - 每个 block 一个 {"k": ..., "v": ...}
     kv_cache: Optional[List[Dict[str, torch.Tensor]]] = None
@@ -47,8 +45,6 @@ class FrameInfo:
             "associated_entities": self.associated_entities,
             "score": self.score,
             "entity_score": self.entity_score,
-            "scene_score": self.scene_score,
-            "scene_texts": self.scene_texts,
         }
 
 
@@ -59,7 +55,7 @@ class MemoryBank:
     职责:
     1. 维护 global_registry (实体注册表)
     2. 维护 frame_archive (帧存档)
-    3. 维护双层 active memory: id_memory (管"谁") + scene_memory (管"在哪")
+    3. 维护 id_memory (entity 驱动的 active memory)
     4. 帧选择和驱逐
     """
 
@@ -67,31 +63,20 @@ class MemoryBank:
                  text_encoder=None,
                  max_memory_frames: int = 3,
                  max_id_memory_frames: int = 4,
-                 max_scene_memory_frames: int = 2,
-                 enable_scene_memory: bool = True,
                  min_id_memory_frames_multi_entity: int = 2,
-                 min_scene_memory_frames: int = 1,
-                 scene_budget_token_threshold: int = 4,
-                 entity_memory_weight: float = 0.6,
-                 scene_memory_weight: float = 0.4,
                  frame_seq_length: int = 1560,
                  num_transformer_blocks: int = 30,
                  save_dir: str = "data",
-                 save_frames_to_disk: bool = False):
+                 save_frames_to_disk: bool = False,
+                 **kwargs):
         """
         初始化Memory Bank
 
         Args:
             text_encoder: WanTextEncoder实例，用于文本编码 (现在不直接使用，改用 crossattn_cache)
-            max_memory_frames: 最大记忆帧数量 (向后兼容，仅在未启用双层记忆时使用)
+            max_memory_frames: 最大记忆帧数量 (向后兼容)
             max_id_memory_frames: ID Memory 最大帧数 (entity 驱动，1~4 帧)
-            max_scene_memory_frames: Scene Memory 最大帧数 (scene 驱动，1~2 帧)
-            enable_scene_memory: 是否启用 scene memory 路径（False 时退化为纯 id-memory）
             min_id_memory_frames_multi_entity: 多实体时 ID Memory 最小帧数
-            min_scene_memory_frames: Scene Memory 最小帧数
-            scene_budget_token_threshold: scene token 数达到该阈值时使用 max_scene_memory_frames
-            entity_memory_weight: 双路融合中 entity 分数权重
-            scene_memory_weight: 双路融合中 scene 分数权重
             frame_seq_length: 每帧的序列长度
             num_transformer_blocks: transformer block 数量 (默认30)
             save_dir: 帧数据保存目录
@@ -100,27 +85,10 @@ class MemoryBank:
         self.text_encoder = text_encoder
         self.max_memory_frames = max_memory_frames
         self.max_id_memory_frames = max_id_memory_frames
-        self.enable_scene_memory = bool(enable_scene_memory)
-        self.max_scene_memory_frames = max_scene_memory_frames if self.enable_scene_memory else 0
         self.min_id_memory_frames_multi_entity = max(
             1,
             min(min_id_memory_frames_multi_entity, self.max_id_memory_frames),
         )
-        if self.enable_scene_memory:
-            self.min_scene_memory_frames = max(
-                1,
-                min(min_scene_memory_frames, self.max_scene_memory_frames),
-            )
-            self.scene_budget_token_threshold = max(1, int(scene_budget_token_threshold))
-            self.entity_memory_weight, self.scene_memory_weight = self._normalize_path_weights(
-                entity_memory_weight,
-                scene_memory_weight,
-            )
-        else:
-            self.min_scene_memory_frames = 0
-            self.scene_budget_token_threshold = 0
-            # ID-only mode: 强制禁用 scene 路径融合权重
-            self.entity_memory_weight, self.scene_memory_weight = 1.0, 0.0
         self.frame_seq_length = frame_seq_length
         self.num_transformer_blocks = num_transformer_blocks
         self.save_dir = save_dir
@@ -130,9 +98,8 @@ class MemoryBank:
         self.global_registry: Dict[str, Dict] = {}
         self.frame_archive: Dict[str, FrameInfo] = {}
 
-        # 双层 active memory (Phase 2)
-        self.id_memory: List[str] = []       # entity 驱动，按 entity_score top-k
-        self.scene_memory: List[str] = []    # scene 驱动，按 scene_score top-k
+        # Active memory (entity 驱动，按 entity_score top-k)
+        self.id_memory: List[str] = []
 
         # KV cache存储 (内存中) - 每个 frame_id 对应 30 个 block 的 KV
         self._frame_kv_store: Dict[str, List[Dict[str, torch.Tensor]]] = {}
@@ -142,26 +109,13 @@ class MemoryBank:
 
     @property
     def frame_active_memory(self) -> List[str]:
-        """向后兼容属性: 返回 id_memory + scene_memory 的去重合并"""
-        if not self.enable_scene_memory:
-            return list(dict.fromkeys(self.id_memory))
-        return list(dict.fromkeys(self.id_memory + self.scene_memory))
-
-    @staticmethod
-    def _normalize_path_weights(entity_weight: float, scene_weight: float) -> Tuple[float, float]:
-        """归一化双路融合权重，异常输入回退到默认 0.6/0.4。"""
-        entity = max(float(entity_weight), 0.0)
-        scene = max(float(scene_weight), 0.0)
-        total = entity + scene
-        if total <= 1e-8:
-            return 0.6, 0.4
-        return entity / total, scene / total
+        """向后兼容属性: 返回 id_memory 的去重列表"""
+        return list(dict.fromkeys(self.id_memory))
 
     @frame_active_memory.setter
     def frame_active_memory(self, value: List[str]):
-        """向后兼容 setter: 直接赋值时写入 id_memory，清空 scene_memory"""
+        """向后兼容 setter: 直接赋值时写入 id_memory"""
         self.id_memory = list(value)
-        self.scene_memory = []
 
     # ============ 实体注册相关 ============
 
@@ -350,19 +304,16 @@ class MemoryBank:
     def retrieve_initial_frames(self, entity_ids: List[int],
                                 scene_texts: Optional[List[str]] = None) -> List[str]:
         """
-        双路检索: 分别填充 id_memory 和 scene_memory
-
-        ID Memory: 按 entity_id 匹配 + entity_score 排序
-        Scene Memory: 按 scene_score 排序 (如果有 scene_texts)
+        检索初始记忆帧: 按 entity_id 匹配 + entity_score 排序填充 id_memory
 
         Args:
             entity_ids: 当前prompt的实体ID列表
-            scene_texts: 当前prompt的场景文本列表
+            scene_texts: (已废弃，保留参数兼容)
 
         Returns:
-            去重合并后的 frame_id 列表 (= frame_active_memory property)
+            frame_id 列表 (= frame_active_memory property)
         """
-        print(f"[DEBUG] retrieve_initial_frames: entity_ids={entity_ids}, scene_texts={scene_texts}, archive_size={len(self.frame_archive)}")
+        print(f"[DEBUG] retrieve_initial_frames: entity_ids={entity_ids}, archive_size={len(self.frame_archive)}")
 
         if not self.frame_archive:
             print(f"[DEBUG] retrieve_initial_frames: No frames in archive")
@@ -385,22 +336,7 @@ class MemoryBank:
             self.id_memory = []
             print(f"[DEBUG] retrieve_initial_frames: no entities, id_memory=[]")
 
-        # === Scene Memory 路径: 按 scene_score ===
-        if self.enable_scene_memory and scene_texts:
-            scene_budget = self._compute_dynamic_scene_budget(scene_texts)
-            scene_candidates = []
-            for fid, fi in self.frame_archive.items():
-                relevance = self._compute_scene_relevance(fi, scene_texts)
-                scene_candidates.append((fid, relevance, fi.scene_score))
-
-            # 先按当前 scene query 的匹配度排序，再用历史 scene_score 打破平局
-            scene_candidates.sort(key=lambda x: (x[1], x[2]), reverse=True)
-            self.scene_memory = [f[0] for f in scene_candidates[:scene_budget]]
-            print(f"[DEBUG] retrieve_initial_frames: scene_budget={scene_budget}, scene_memory={self.scene_memory}")
-        else:
-            self.scene_memory = []
-
-        result = self.frame_active_memory  # property: 去重合并
+        result = self.frame_active_memory
         print(f"[DEBUG] retrieve_initial_frames: combined={result}")
         return result
 
@@ -416,9 +352,7 @@ class MemoryBank:
                                 prompt_text: Optional[str] = None,
                                 scene_texts: Optional[List[str]] = None) -> Tuple[str, float]:
         """
-        从驱逐的chunk中选择最佳帧 (双路打分)
-
-        同时计算 entity_score 和 scene_score，综合分数 = 0.6*entity + 0.4*scene
+        从驱逐的chunk中选择最佳帧 (entity 打分)
 
         Args:
             evicted_chunk_kv: 驱逐chunk的KV cache (所有30个block)
@@ -428,10 +362,10 @@ class MemoryBank:
             current_entity_ids: 当前prompt的实体ID列表
             current_entities: 当前prompt的实体列表
             prompt_text: 当前 prompt 文本
-            scene_texts: 当前 prompt 的场景文本列表
+            scene_texts: (已废弃，保留参数兼容)
 
         Returns:
-            (frame_id, score) - 选中的帧ID和综合分数
+            (frame_id, score) - 选中的帧ID和分数
         """
         if not evicted_chunk_kv or not crossattn_cache:
             raise ValueError("evicted_chunk_kv and crossattn_cache must not be empty")
@@ -450,14 +384,10 @@ class MemoryBank:
             import warnings
             warnings.warn("[MemoryBank] crossattn_cache not initialized, selecting first frame by default")
             entity_scores = torch.ones(num_candidate_frames, device=device, dtype=dtype)
-            if self.enable_scene_memory:
-                scene_scores = torch.ones(num_candidate_frames, device=device, dtype=dtype)
-            else:
-                scene_scores = torch.zeros(num_candidate_frames, device=device, dtype=dtype)
         else:
             num_text_tokens = crossattn_cache[0]["k"].shape[1]
 
-            # 1. Entity 路径: entity+attrs token 权重打分
+            # Entity 路径: entity+attrs token 权重打分
             entity_weights = self._build_entity_token_weights(
                 current_entities, num_text_tokens, prompt_text
             )
@@ -466,32 +396,13 @@ class MemoryBank:
                 available_layers, num_candidate_frames
             )
 
-            # 2. Scene 路径: scene text token 权重打分
-            if self.enable_scene_memory and scene_texts:
-                scene_weights = self._build_scene_token_weights(
-                    scene_texts, num_text_tokens, prompt_text, current_entities
-                )
-                scene_scores = self._consensus_score(
-                    evicted_chunk_kv, crossattn_cache, scene_weights,
-                    available_layers, num_candidate_frames
-                )
-            else:
-                scene_scores = torch.zeros(num_candidate_frames, device=device, dtype=dtype)
-
-        # 3. 综合分数
-        combined_scores = (self.entity_memory_weight * entity_scores
-                           + self.scene_memory_weight * scene_scores)
-
         # 选择最高分帧
-        best_frame_idx = combined_scores.argmax().item()
-        best_score = combined_scores[best_frame_idx].item()
-        best_entity_score = entity_scores[best_frame_idx].item()
-        best_scene_score = scene_scores[best_frame_idx].item()
+        best_frame_idx = entity_scores.argmax().item()
+        best_score = entity_scores[best_frame_idx].item()
+        best_entity_score = best_score
 
         print(f"[DEBUG] select_frame_from_chunk: entity_scores={entity_scores.tolist()}")
-        print(f"[DEBUG] select_frame_from_chunk: scene_scores={scene_scores.tolist()}")
-        print(f"[DEBUG] select_frame_from_chunk: combined={combined_scores.tolist()}")
-        print(f"[DEBUG] select_frame_from_chunk: best_frame_idx={best_frame_idx}, score={best_score:.4f} (entity={best_entity_score:.4f}, scene={best_scene_score:.4f})")
+        print(f"[DEBUG] select_frame_from_chunk: best_frame_idx={best_frame_idx}, score={best_score:.4f}")
 
         # 生成frame_id
         frame_id = f"p{prompt_id}_c{chunk_id}_f{best_frame_idx}"
@@ -499,7 +410,7 @@ class MemoryBank:
         # 提取该帧的KV cache (所有30个block)
         frame_kv = self._extract_frame_kv_all_blocks(evicted_chunk_kv, best_frame_idx)
 
-        # 保存帧信息 (含双分数)
+        # 保存帧信息
         frame_info = FrameInfo(
             frame_id=frame_id,
             frame_path=os.path.join(self.save_dir, f"{frame_id}.pt"),
@@ -507,8 +418,6 @@ class MemoryBank:
             associated_entities=list(dict.fromkeys(str(eid) for eid in current_entity_ids)),
             score=best_score,
             entity_score=best_entity_score,
-            scene_score=best_scene_score,
-            scene_texts=(scene_texts or []).copy(),
             kv_cache=frame_kv
         )
 
@@ -869,94 +778,6 @@ class MemoryBank:
 
         return weights
 
-    def _build_scene_token_weights(self,
-                                    scene_texts: Optional[List[str]],
-                                    num_tokens: int,
-                                    prompt_text: Optional[str] = None,
-                                    entities: Optional[List['EntityStruct']] = None) -> torch.Tensor:
-        """
-        构建 scene token 权重向量 — 与 _build_entity_token_weights 互补
-
-        策略:
-        - scene 关键词区域权重高 (2.5x)
-        - entity/attrs 区域权重低 (0.5x)
-        - 无 scene 信息时返回均匀权重
-
-        Args:
-            scene_texts: 场景文本列表 (如 ["snowy forest", "overcast daylight"])
-            num_tokens: token 总数 (通常为 512)
-            prompt_text: 原始 prompt 文本 (用于精确定位)
-            entities: 实体列表 (用于降权 entity 区域)
-
-        Returns:
-            权重向量 [num_tokens]
-        """
-        weights = torch.ones(num_tokens)
-
-        if not scene_texts:
-            return weights
-
-        if prompt_text is None or len(prompt_text) == 0:
-            # 无 prompt 文本，使用开头区域加权 (场景描述通常在 prompt 开头)
-            scene_end = int(num_tokens * 0.30)
-            weights[:scene_end] = 2.0
-            return weights
-
-        prompt_lower = prompt_text.lower()
-        prompt_len = len(prompt_text)
-
-        # Step 1: 定位 scene 关键词并加权
-        scene_weight = 2.5
-        scene_positions = []
-
-        for scene_text in scene_texts:
-            scene_lower = scene_text.lower()
-            pos = prompt_lower.find(scene_lower)
-            if pos != -1:
-                start_ratio = pos / prompt_len
-                end_ratio = (pos + len(scene_lower)) / prompt_len
-                scene_positions.append((start_ratio, end_ratio))
-
-        for start_ratio, end_ratio in scene_positions:
-            start_token = max(0, int((start_ratio - 0.02) * num_tokens))
-            end_token = min(num_tokens, int((end_ratio + 0.02) * num_tokens))
-            for i in range(start_token, end_token):
-                weights[i] = max(weights[i].item(), scene_weight)
-
-        # Step 2: 降权 entity/attrs 区域
-        if entities:
-            entity_suppress = 0.5
-            for entity in entities:
-                entity_lower = entity.entity.lower()
-                pos = prompt_lower.find(entity_lower)
-                if pos != -1:
-                    start_ratio = pos / prompt_len
-                    end_ratio = (pos + len(entity_lower)) / prompt_len
-                    start_token = max(0, int((start_ratio - 0.02) * num_tokens))
-                    end_token = min(num_tokens, int((end_ratio + 0.02) * num_tokens))
-                    for i in range(start_token, end_token):
-                        if weights[i] <= 1.0:  # 不覆盖已标记为 scene 的区域
-                            weights[i] = entity_suppress
-
-                for attr in entity.attrs:
-                    attr_lower = attr.lower()
-                    pos = prompt_lower.find(attr_lower)
-                    if pos != -1:
-                        start_ratio = pos / prompt_len
-                        end_ratio = (pos + len(attr_lower)) / prompt_len
-                        start_token = max(0, int((start_ratio - 0.02) * num_tokens))
-                        end_token = min(num_tokens, int((end_ratio + 0.02) * num_tokens))
-                        for i in range(start_token, end_token):
-                            if weights[i] <= 1.0:
-                                weights[i] = entity_suppress
-
-        if scene_positions:
-            print(f"[DEBUG] Scene keyword positions: {len(scene_positions)} keywords found")
-        else:
-            print(f"[DEBUG] No scene keywords found in prompt, using uniform weights")
-
-        return weights
-
     def _extract_frame_kv_all_blocks(self,
                                       all_blocks_kv: List[Dict[str, torch.Tensor]],
                                       frame_idx: int) -> List[Dict[str, torch.Tensor]]:
@@ -981,88 +802,6 @@ class MemoryBank:
             })
 
         return frame_kv_all_blocks
-
-    @staticmethod
-    def _normalize_scene_texts(scene_texts: Optional[List[str]]) -> Tuple[set, set]:
-        """将 scene 文本归一化为短语集合和 token 集合。"""
-        if not scene_texts:
-            return set(), set()
-
-        phrases = set()
-        tokens = set()
-        for text in scene_texts:
-            if not isinstance(text, str):
-                continue
-            norm = text.strip().lower()
-            if not norm:
-                continue
-            phrases.add(norm)
-
-            # 仅英文/数字 token
-            tokens.update(re.findall(r"[a-z0-9]+", norm))
-        return phrases, tokens
-
-    @staticmethod
-    def _compute_scene_distance(old_texts: List[str], new_texts: List[str]) -> float:
-        """
-        计算两组 scene text 的语义距离 (基于 token Jaccard)
-
-        Jaccard 距离: 1 - |A∩B| / |A∪B|
-
-        Args:
-            old_texts: 上一个 prompt 的场景文本
-            new_texts: 当前 prompt 的场景文本
-
-        Returns:
-            距离值 [0, 1]，0 = 完全相同，1 = 完全不同
-        """
-        _, old_tokens = MemoryBank._normalize_scene_texts(old_texts)
-        _, new_tokens = MemoryBank._normalize_scene_texts(new_texts)
-
-        if not old_tokens and not new_tokens:
-            return 0.0
-        if not old_tokens or not new_tokens:
-            return 1.0
-
-        intersection = len(old_tokens & new_tokens)
-        union = len(old_tokens | new_tokens)
-        return 1.0 - intersection / union
-
-    def _compute_scene_relevance(self, frame_info: FrameInfo, query_scene_texts: List[str]) -> float:
-        """计算 frame 与当前 scene query 的相关度。"""
-        query_phrases, query_tokens = self._normalize_scene_texts(query_scene_texts)
-        if not query_phrases and not query_tokens:
-            return frame_info.scene_score
-
-        frame_phrases, frame_tokens = self._normalize_scene_texts(frame_info.scene_texts)
-        if not frame_phrases and not frame_tokens:
-            return frame_info.scene_score
-
-        phrase_overlap = len(query_phrases & frame_phrases) / max(1, len(query_phrases))
-        token_overlap = len(query_tokens & frame_tokens) / max(1, len(query_tokens))
-
-        # 当前 query 匹配度为主，历史 scene_score 作为轻量先验
-        return 0.7 * phrase_overlap + 0.2 * token_overlap + 0.1 * max(0.0, frame_info.scene_score)
-
-    def _compute_dynamic_scene_budget(self, scene_texts: Optional[List[str]]) -> int:
-        """
-        根据 scene query 复杂度计算 Scene Memory 预算（1~2）。
-
-        规则：
-        - 无 scene query: 0
-        - token 数 < scene_budget_token_threshold: min_scene_memory_frames
-        - token 数 >= scene_budget_token_threshold: max_scene_memory_frames
-        """
-        if (not self.enable_scene_memory) or (not scene_texts):
-            return 0
-
-        _, scene_tokens = self._normalize_scene_texts(scene_texts)
-        if len(scene_tokens) >= self.scene_budget_token_threshold:
-            budget = self.max_scene_memory_frames
-        else:
-            budget = self.min_scene_memory_frames
-
-        return max(self.min_scene_memory_frames, min(budget, self.max_scene_memory_frames))
 
     def _save_frame_kv(self, frame_id: str, frame_kv: List[Dict[str, torch.Tensor]]) -> None:
         """保存帧KV到文件 (所有 block)"""
@@ -1161,41 +900,6 @@ class MemoryBank:
             else:
                 print(f"[DEBUG] update_id_memory: Kept existing, new {entity_score:.4f} <= min {min_score:.4f}")
 
-    def update_scene_memory(self, frame_id: str, scene_score: float) -> None:
-        """
-        按 scene_score top-k 更新 Scene Memory 槽
-
-        Args:
-            frame_id: 新帧ID
-            scene_score: scene 维度分数
-        """
-        if (not self.enable_scene_memory) or frame_id not in self.frame_archive:
-            return
-
-        if len(self.scene_memory) < self.max_scene_memory_frames:
-            if frame_id not in self.scene_memory:
-                self.scene_memory.append(frame_id)
-                print(f"[DEBUG] update_scene_memory: Added {frame_id} (scene_score={scene_score:.4f})")
-        else:
-            # 找到 scene_memory 中 scene_score 最低的帧
-            min_score = float('inf')
-            min_idx = -1
-            min_fid = None
-
-            for idx, fid in enumerate(self.scene_memory):
-                if fid in self.frame_archive:
-                    finfo = self.frame_archive[fid]
-                    if finfo.scene_score < min_score:
-                        min_score = finfo.scene_score
-                        min_idx = idx
-                        min_fid = fid
-
-            if scene_score > min_score and min_idx >= 0:
-                self.scene_memory[min_idx] = frame_id
-                print(f"[DEBUG] update_scene_memory: Replaced {min_fid}(score={min_score:.4f}) with {frame_id}(score={scene_score:.4f})")
-            else:
-                print(f"[DEBUG] update_scene_memory: Kept existing, new {scene_score:.4f} <= min {min_score:.4f}")
-
     def get_memory_kv(self, device: torch.device = None) -> Optional[List[Dict[str, torch.Tensor]]]:
         """
         获取当前active memory的KV cache (所有 block)
@@ -1273,7 +977,6 @@ class MemoryBank:
             },
             "frame_active_memory": self.frame_active_memory,
             "id_memory": self.id_memory,
-            "scene_memory": self.scene_memory,
         }
 
         with open(path, 'w', encoding='utf-8') as f:
@@ -1293,14 +996,11 @@ class MemoryBank:
             data = json.load(f)
 
         self.global_registry = data.get("global_registry", {})
-        # 加载双层记忆 (向后兼容: 旧 JSON 只有 frame_active_memory)
+        # 向后兼容: 旧 JSON 只有 frame_active_memory
         if "id_memory" in data:
             self.id_memory = data["id_memory"]
-            self.scene_memory = data.get("scene_memory", [])
         else:
-            # 旧格式兼容: frame_active_memory → id_memory
             self.id_memory = data.get("frame_active_memory", [])
-            self.scene_memory = []
 
         # 加载frame_archive
         self.frame_archive = {}
@@ -1312,8 +1012,6 @@ class MemoryBank:
                 associated_entities=finfo_dict.get("associated_entities", []),
                 score=finfo_dict.get("score", 0.0),
                 entity_score=finfo_dict.get("entity_score", 0.0),
-                scene_score=finfo_dict.get("scene_score", 0.0),
-                scene_texts=finfo_dict.get("scene_texts", []),
             )
 
     def clear(self) -> None:
@@ -1321,7 +1019,6 @@ class MemoryBank:
         self.global_registry = {}
         self.frame_archive = {}
         self.id_memory = []
-        self.scene_memory = []
         self._frame_kv_store = {}
 
     def clear_frame_store(self) -> None:

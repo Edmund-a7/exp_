@@ -20,21 +20,21 @@ MEMFLOW_BASE="${PROJECT_ROOT}/IAMFlow/checkpoints/base.pt"
 MEMFLOW_LORA="${PROJECT_ROOT}/IAMFlow/checkpoints/lora.pt"
 IAMFLOW_BASE="${PROJECT_ROOT}/IAMFlow/checkpoints/base.pt"
 IAMFLOW_LORA="${PROJECT_ROOT}/IAMFlow/checkpoints/lora.pt"
-IAMFLOW_CONFIG="${PROJECT_ROOT}/IAMFlow/configs/agent_interactive_inference_continuity.yaml"
+# IAMFLOW_CONFIG="${PROJECT_ROOT}/IAMFlow/configs/agent_interactive_inference_continuity.yaml"
 # 只测 id-memory 时改为:
-# IAMFLOW_CONFIG="${PROJECT_ROOT}/IAMFlow/configs/agent_interactive_inference_id_only.yaml"
+IAMFLOW_CONFIG="${PROJECT_ROOT}/IAMFlow/configs/agent_interactive_inference_id_only.yaml"
 
 # Input / Output
 # INPUT_PROMPTS="${PROJECT_ROOT}/memflow_benchmark.jsonl"
 # OUTPUT_DIR="${PROJECT_ROOT}/benchmark_results/memflow_benchmark"
-INPUT_PROMPTS="${PROJECT_ROOT}/id_stress_test_6_batch.jsonl"
+INPUT_PROMPTS="${PROJECT_ROOT}/id_stress_test_6_interactive_style.jsonl"
 # 如果你把 prompt 放在 Benchmark/prompt_expander 下，启用下面这一行：
 # INPUT_PROMPTS="${PROJECT_ROOT}/Benchmark/prompt_expander/id_stress_test_6_batch.jsonl"
-OUTPUT_DIR="${PROJECT_ROOT}/benchmark_results/id_stress_test_batch_6"
+OUTPUT_DIR="${PROJECT_ROOT}/benchmark_results/id_stress_test_6_interactive_style"
 # INPUT_PROMPTS="${PROJECT_ROOT}/interactive_1_2.jsonl"
 # OUTPUT_DIR="${PROJECT_ROOT}/benchmark_results/interactive_1_2"
 SEED=42
-USE_LIGHTVAE=false  # 设为 true 启用 LightVAE (75% 通道剪枝)
+USE_LIGHTVAE=true  # 设为 true 启用 LightVAE (75% 通道剪枝)
 # ==============================================================
 
 export WAN_MODEL_PATH="${WAN_MODEL_PATH}"
