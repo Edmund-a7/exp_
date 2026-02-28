@@ -17,20 +17,13 @@ model_kwargs:
   sink_size: 3
   bank_size: 6
   record_interval: 3
-  SMA: True   # Enabled (TCAT disabled)
-  # TCAT: Temporal Coverage Aware Top-k
-  tcat_enabled: False
-  tcat_sink_k: 1   # Select top-1 from Sink region (3 chunks)
-  tcat_mem_k: 2    # Select top-2 from Mem region (3 chunks)
-  tcat_local_k: 3  # Select top-3 from Local-far region (6 chunks)
-  tcat_local_near: 3  # Preserve last 3 chunks (most recent frames)
-  tcat_ema_alpha: 0.3  # EMA smoothing factor (0=disabled)
+  SMA: True
   # HSA: hierarchical sparse attention (sink+memory frame top-k + block top-k_b)
   hsa_enabled: false
   hsa_frame_top_k: 2
   hsa_frame_min_sink: 1
   hsa_frame_min_mem: 1
-  hsa_local_far_frames: 3
+  hsa_local_far_frames: 6
   hsa_local_near_frames: 3
   hsa_block_size: 64
   hsa_block_keep_ratio: 0.35
@@ -79,9 +72,10 @@ llm_model_path: ../Qwen3-0.6B
 max_memory_frames: 3
 save_dir: data/agent_frames
 use_vllm: true  # 使用 vLLM 加速 LLM 推理 (需要安装 vllm)
-entity_memory_weight: 0.72
-scene_memory_weight: 0.28
-scene_skip_threshold: 0.3
 min_id_memory_frames_multi_entity: 2
-min_scene_memory_frames: 1
-scene_budget_token_threshold: 4
+# Prompt-level HSA sparse schedule
+hsa_prompt_schedule_enabled: true
+hsa_prompt_schedule_mode: increase   # increase: 0.3->0.5, decrease: 0.5->0.3
+hsa_prompt_keep_ratio_min: 0.3
+hsa_prompt_keep_ratio_max: 0.5
+hsa_chunk0_force_sma: true

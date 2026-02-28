@@ -26,6 +26,7 @@ from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from utils.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation
 from utils.debug_option import DEBUG
 from utils.profiling import compute_pure_diffusion_time
+from utils.hsa_schedule import compute_prompt_sparse_policy
 
 # IAM 模块
 from iam.llm_agent import LLMAgent, EntityStruct, SceneStruct
@@ -81,49 +82,41 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         self.llm_agent = LLMAgent(model_path=llm_model_path, use_vllm=use_vllm,
                                   gpu_memory_utilization=gpu_memory_utilization)
 
-        # 双路融合与场景跳过配置（可在 YAML 顶层覆盖）
-        self.entity_memory_weight = float(getattr(args, "entity_memory_weight", 0.6))
-        self.scene_memory_weight = float(getattr(args, "scene_memory_weight", 0.4))
-        self.enable_scene_memory = bool(getattr(args, "enable_scene_memory", True))
-        self.scene_skip_threshold = float(getattr(args, "scene_skip_threshold", 0.3))
+        # 配置（可在 YAML 顶层覆盖）
         self.min_id_memory_frames_multi_entity = int(
             getattr(args, "min_id_memory_frames_multi_entity", 2)
         )
-        self.min_scene_memory_frames = int(getattr(args, "min_scene_memory_frames", 1))
-        self.scene_budget_token_threshold = int(getattr(args, "scene_budget_token_threshold", 4))
         self.keep_bank_on_spt_switch = bool(getattr(args, "keep_bank_on_spt_switch", False))
+        # Prompt-level sparse schedule:
+        # chunk0 -> SMA, remaining chunks -> HSA keep_ratio scheduled in [min, max]
+        self.hsa_prompt_schedule_enabled = bool(getattr(args, "hsa_prompt_schedule_enabled", True))
+        self.hsa_prompt_schedule_mode = str(getattr(args, "hsa_prompt_schedule_mode", "increase")).lower()
+        self.hsa_prompt_keep_ratio_min = float(getattr(args, "hsa_prompt_keep_ratio_min", 0.3))
+        self.hsa_prompt_keep_ratio_max = float(getattr(args, "hsa_prompt_keep_ratio_max", 0.5))
+        self.hsa_chunk0_force_sma = bool(getattr(args, "hsa_chunk0_force_sma", True))
+        # Feature gate by model config to avoid passing overrides when HSA is disabled.
+        self.hsa_enabled = bool(getattr(self.args.model_kwargs, "hsa_enabled", False))
 
         # 初始化 Memory Bank (使用父类的 text_encoder)
         self.agent_memory_bank = MemoryBank(
             text_encoder=self.text_encoder,
             max_memory_frames=max_memory_frames,
-            enable_scene_memory=self.enable_scene_memory,
             min_id_memory_frames_multi_entity=self.min_id_memory_frames_multi_entity,
-            min_scene_memory_frames=self.min_scene_memory_frames,
-            scene_budget_token_threshold=self.scene_budget_token_threshold,
-            entity_memory_weight=self.entity_memory_weight,
-            scene_memory_weight=self.scene_memory_weight,
             frame_seq_length=self.frame_seq_length,
             num_transformer_blocks=self.num_transformer_blocks,
             save_dir=save_dir,
             save_frames_to_disk=save_frames_to_disk
         )
 
-        # Phase 3: bank_size 需要容纳双层记忆的最大帧数 (id=4 + scene=2 = 6)
-        dual_memory_max = (
-            self.agent_memory_bank.max_id_memory_frames
-            + self.agent_memory_bank.max_scene_memory_frames
-        )
-        if self.bank_size < dual_memory_max:
-            self.bank_size = dual_memory_max
+        # bank_size 需要容纳 id_memory 的最大帧数
+        if self.bank_size < self.agent_memory_bank.max_id_memory_frames:
+            self.bank_size = self.agent_memory_bank.max_id_memory_frames
 
         # 状态追踪
         self.current_prompt_id = 0
         self.current_chunk_id = 0
         self.current_entities: List[EntityStruct] = []
         self.current_prompt_text: str = ""  # 当前 prompt 文本，用于精确定位实体位置
-        self.current_scene_texts: List[str] = []  # 当前 prompt 的场景文本 (Phase 2 双层记忆使用)
-        self.prev_scene_texts: List[str] = []  # Phase 3: 上一个 prompt 的场景文本，用于同场景跳过
 
         # P0 优化: 缓存 IAM bank 长度，避免在 forward 中调用 .item()
         self._iam_bank_length = 0
@@ -270,6 +263,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         # 时序循环
         all_num_frames = [self.num_frame_per_block] * num_blocks
         segment_idx = 0
+        prompt_start_frame = 0
         next_switch_pos = (
             switch_frame_indices[segment_idx]
             if segment_idx < len(switch_frame_indices)
@@ -303,6 +297,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             # ===== 1. 检测 prompt 切换 =====
             if next_switch_pos is not None and current_start_frame >= next_switch_pos:
                 segment_idx += 1
+                prompt_start_frame = switch_frame_indices[segment_idx - 1]
 
                 # ===== 2. Prompt 切换处理 (必须在 LLM Agent 处理之前) =====
                 if profile:
@@ -370,6 +365,27 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             # SPT: 获取当前过渡系数（按 chunk 采样，alpha 在一个 chunk 内保持不变）
             transition_alpha = self._get_current_transition_alpha() if self.spt_enabled else None
 
+            # Prompt 内动态稀疏调度：
+            # chunk0 强制 SMA；其余 chunk 在 [min,max] 线性分配 keep_ratio。
+            force_sma_for_chunk = False
+            hsa_keep_ratio_override = None
+            if self.hsa_enabled and self.hsa_prompt_schedule_enabled:
+                prompt_end_frame = next_switch_pos if next_switch_pos is not None else num_output_frames
+                prompt_total_chunks = max(
+                    1, (prompt_end_frame - prompt_start_frame) // self.num_frame_per_block
+                )
+                prompt_chunk_idx = max(
+                    0, (current_start_frame - prompt_start_frame) // self.num_frame_per_block
+                )
+                force_sma_for_chunk, hsa_keep_ratio_override = compute_prompt_sparse_policy(
+                    chunk_idx_in_prompt=prompt_chunk_idx,
+                    total_chunks_in_prompt=prompt_total_chunks,
+                    min_keep_ratio=self.hsa_prompt_keep_ratio_min,
+                    max_keep_ratio=self.hsa_prompt_keep_ratio_max,
+                    schedule_mode=self.hsa_prompt_schedule_mode,
+                    force_sma_chunk0=self.hsa_chunk0_force_sma,
+                )
+
             # ===== 4. 空间去噪循环 =====
             for index, current_timestep in enumerate(self.denoising_step_list):
                 # q_bank=True 让模型读取 bank，但 update_bank=False 不让 MemFlow 更新
@@ -396,6 +412,8 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
                         update_bank=False,  # 关键: 始终 False
                         q_bank=q_bank,
                         iam_bank_length=self._iam_bank_length,  # P0 优化
+                        hsa_keep_ratio_override=hsa_keep_ratio_override,
+                        force_sma=force_sma_for_chunk,
                         prev_crossattn_cache=self.prev_crossattn_cache,
                         transition_alpha=transition_alpha,
                     )
@@ -420,6 +438,8 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
                         update_bank=False,  # 关键: 始终 False
                         q_bank=q_bank,
                         iam_bank_length=self._iam_bank_length,  # P0 优化
+                        hsa_keep_ratio_override=hsa_keep_ratio_override,
+                        force_sma=force_sma_for_chunk,
                         prev_crossattn_cache=self.prev_crossattn_cache,
                         transition_alpha=transition_alpha,
                     )
@@ -430,7 +450,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             # ===== 5. IAM 帧选择和 bank 更新 (chunk >= 3 时) =====
             # 关键：必须在 clean context 更新前获取被驱逐的 chunk
             self.current_chunk_id += 1
-            if self.current_chunk_id >= 3 and (self.current_entities or self.current_scene_texts):
+            if self.current_chunk_id >= 3 and self.current_entities:
                 if profile:
                     memory_start.record()
 
@@ -461,6 +481,8 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
                 q_bank=q_bank,
                 update_cache=True,
                 iam_bank_length=self._iam_bank_length,  # P0 优化
+                hsa_keep_ratio_override=hsa_keep_ratio_override,
+                force_sma=force_sma_for_chunk,
                 prev_crossattn_cache=self.prev_crossattn_cache,
                 transition_alpha=transition_alpha,
             )
@@ -623,8 +645,6 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         self.current_chunk_id = 0
         self.current_entities = []
         self.current_prompt_text = ""
-        self.current_scene_texts = []
-        self.prev_scene_texts = []
         self.agent_memory_bank.clear()
         self._iam_bank_length = 0
         # 重置 LLM Agent 的 ID 计数器，确保每次推理 global_registry 从 1 开始
@@ -654,23 +674,18 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         print(f"[DEBUG] is_first_prompt: {is_first_prompt}")
         print(f"{'='*60}")
 
-        # 1. LLM Agent 提取实体并分配 ID，同时提取场景文本
-        entities, registry_update, scene_texts = self.llm_agent.process_prompt(
+        # 1. LLM Agent 提取实体并分配 ID
+        entities, registry_update, _scene_texts = self.llm_agent.process_prompt(
             prompt=prompt_text,
             prompt_id=prompt_id,
             global_registry=self.agent_memory_bank.global_registry
         )
 
         self.current_entities = entities
-        if self.enable_scene_memory:
-            self.current_scene_texts = scene_texts
-        else:
-            self.current_scene_texts = []
 
         print(f"[DEBUG] Extracted {len(entities)} entities:")
         for e in entities:
             print(f"  - entity='{e.entity}', global_id={e.global_id}, attrs={e.attrs}")
-        print(f"[DEBUG] Extracted scene: {self.current_scene_texts}")
 
         print(f"[DEBUG] Registry update: {list(registry_update.keys()) if registry_update else 'None'}")
 
@@ -684,47 +699,16 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
 
         print(f"[DEBUG] Global registry after update: {list(self.agent_memory_bank.global_registry.keys())}")
 
-        # 3. 检索初始记忆帧 (非首个 prompt) — 双路检索 + 同场景跳过
-        if not is_first_prompt and (entities or self.current_scene_texts):
-            entity_ids = self.agent_memory_bank.get_entity_ids(entities) if entities else []
+        # 3. 检索初始记忆帧 (非首个 prompt)
+        if not is_first_prompt and entities:
+            entity_ids = self.agent_memory_bank.get_entity_ids(entities)
 
-            # Phase 3: 同场景跳过 — 场景未变时保留 scene_memory，只更新 id_memory
-            skip_scene = False
-            if self.enable_scene_memory and self.prev_scene_texts and self.current_scene_texts:
-                scene_dist = self._compute_scene_distance(
-                    self.prev_scene_texts, self.current_scene_texts
-                )
-                if scene_dist <= self.scene_skip_threshold:
-                    skip_scene = True
-                    print(
-                        f"[DEBUG] Scene unchanged (dist={scene_dist:.3f} <= {self.scene_skip_threshold}), skipping scene retrieval"
-                    )
-                else:
-                    print(
-                        f"[DEBUG] Scene changed (dist={scene_dist:.3f} > {self.scene_skip_threshold}), re-retrieving scene memory"
-                    )
+            print(f"[DEBUG] Retrieving initial frames for entity_ids: {entity_ids}")
 
-            print(
-                f"[DEBUG] Retrieving initial frames for entity_ids: {entity_ids}, "
-                f"scene_texts: {self.current_scene_texts}, skip_scene={skip_scene}"
-            )
-            retrieve_scene = None if (skip_scene or not self.enable_scene_memory) else self.current_scene_texts
-            old_scene_memory = (
-                self.agent_memory_bank.scene_memory.copy()
-                if (skip_scene and self.enable_scene_memory)
-                else []
-            )
-
-            retrieved_frames = self.agent_memory_bank.retrieve_initial_frames(
-                entity_ids, scene_texts=retrieve_scene
-            )
-
-            # 恢复被跳过的 scene_memory
-            if skip_scene and self.enable_scene_memory:
-                self.agent_memory_bank.scene_memory = old_scene_memory
+            retrieved_frames = self.agent_memory_bank.retrieve_initial_frames(entity_ids)
 
             print(f"[DEBUG] Retrieved initial frames: {self.agent_memory_bank.frame_active_memory}")
-            print(f"[DEBUG] id_memory={self.agent_memory_bank.id_memory}, scene_memory={self.agent_memory_bank.scene_memory}")
+            print(f"[DEBUG] id_memory={self.agent_memory_bank.id_memory}")
 
             if DEBUG:
                 print(f"[AgentPipeline] Retrieved initial frames: {self.agent_memory_bank.frame_active_memory}")
@@ -732,9 +716,6 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             # 注入检索到的帧
             self._inject_iam_memory_to_bank()
             print(f"[DEBUG] Injected memory frames to kv_bank")
-
-        # Phase 3: 更新 prev_scene_texts
-        self.prev_scene_texts = self.current_scene_texts if self.enable_scene_memory else []
 
     def _process_chunk_eviction(self,
                                 current_start_frame: int,
@@ -746,7 +727,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             current_start_frame: 当前起始帧
             current_num_frames: 当前块帧数
         """
-        if not self.current_entities and not self.current_scene_texts:
+        if not self.current_entities:
             return
 
         # 获取被驱逐的 chunk 的 KV (从 kv_cache 中，所有 30 个 block)
@@ -759,7 +740,7 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         print(f"[DEBUG] current_start_frame={current_start_frame}, current_num_frames={current_num_frames}")
         print(f"[DEBUG] evicted_chunk_kv shape: k={evicted_chunk_kv[0]['k'].shape}")
 
-        # IAM 双路帧选择
+        # IAM 帧选择
         entity_ids = self.agent_memory_bank.get_entity_ids(self.current_entities)
         frame_id, score = self.agent_memory_bank.select_frame_from_chunk(
             evicted_chunk_kv=evicted_chunk_kv,
@@ -769,20 +750,16 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             current_entity_ids=entity_ids,
             current_entities=self.current_entities,
             prompt_text=self.current_prompt_text,
-            scene_texts=self.current_scene_texts,
         )
 
         print(f"[DEBUG] IAM selected frame: {frame_id}, score={score:.4f}")
 
-        # 双路更新: 分别更新 id_memory 和 scene_memory
+        # 更新 id_memory
         frame_info = self.agent_memory_bank.frame_archive[frame_id]
         self.agent_memory_bank.update_id_memory(frame_id, frame_info.entity_score)
-        if self.enable_scene_memory:
-            self.agent_memory_bank.update_scene_memory(frame_id, frame_info.scene_score)
 
         print(f"[DEBUG] id_memory={self.agent_memory_bank.id_memory}")
-        print(f"[DEBUG] scene_memory={self.agent_memory_bank.scene_memory}")
-        print(f"[DEBUG] Active memory (combined): {self.agent_memory_bank.frame_active_memory}")
+        print(f"[DEBUG] Active memory: {self.agent_memory_bank.frame_active_memory}")
         print(f"[DEBUG] Frame archive size: {len(self.agent_memory_bank.frame_archive)}")
 
         if DEBUG:
@@ -894,11 +871,6 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
         if DEBUG:
             print(f"[AgentPipeline] Injected {memory_length} tokens from IAM to kv_bank (all {len(self.kv_bank1)} blocks)")
 
-    @staticmethod
-    def _compute_scene_distance(old_texts: List[str], new_texts: List[str]) -> float:
-        """计算两组 scene text 的语义距离，委托给 MemoryBank"""
-        return MemoryBank._compute_scene_distance(old_texts, new_texts)
-
     # ============ 辅助方法 ============
 
     def get_agent_status(self) -> Dict[str, Any]:
@@ -907,7 +879,6 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             "current_prompt_id": self.current_prompt_id,
             "current_chunk_id": self.current_chunk_id,
             "current_entities": [e.to_dict() for e in self.current_entities],
-            "current_scene_texts": self.current_scene_texts,
             "global_registry": self.agent_memory_bank.global_registry,
             "frame_archive_count": len(self.agent_memory_bank.frame_archive),
             "active_memory": self.agent_memory_bank.frame_active_memory

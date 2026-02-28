@@ -81,19 +81,12 @@ class CausalWanSelfAttention(nn.Module):
                  record_interval=3,
                  SMA=False,
                  sparse_top_k=6,
-                 # TCAT parameters
-                 tcat_enabled=False,
-                 tcat_sink_k=1,
-                 tcat_mem_k=2,
-                 tcat_local_k=3,
-                 tcat_local_near=3,  # v2: preserve last N chunks of Local
-                 tcat_ema_alpha=0.3,
                  # HSA parameters
                  hsa_enabled=False,
                  hsa_frame_top_k=2,
                  hsa_frame_min_sink=1,
                  hsa_frame_min_mem=1,
-                 hsa_local_far_frames=3,
+                 hsa_local_far_frames=6,
                  hsa_local_near_frames=3,
                  hsa_block_size=64,
                  hsa_block_keep_ratio=0.35,
@@ -110,13 +103,6 @@ class CausalWanSelfAttention(nn.Module):
         self.record_interval = record_interval
         self.SMA = SMA
         self.sparse_top_k = sparse_top_k
-        # TCAT parameters
-        self.tcat_enabled = tcat_enabled
-        self.tcat_sink_k = tcat_sink_k
-        self.tcat_mem_k = tcat_mem_k
-        self.tcat_local_k = tcat_local_k
-        self.tcat_local_near = tcat_local_near  # v2: preserve last N chunks
-        self.tcat_ema_alpha = tcat_ema_alpha
         # HSA parameters
         self.hsa_enabled = hsa_enabled
         self.hsa_frame_top_k = hsa_frame_top_k
@@ -127,10 +113,6 @@ class CausalWanSelfAttention(nn.Module):
         self.hsa_block_size = hsa_block_size
         self.hsa_block_keep_ratio = hsa_block_keep_ratio
         self.hsa_block_min_blocks = hsa_block_min_blocks
-        # TCAT EMA state (per region)
-        self.tcat_prev_scores_sink = None
-        self.tcat_prev_scores_mem = None
-        self.tcat_prev_scores_local = None
 
         # Support list/tuple local_attn_size by converting to list first (handles OmegaConf ListConfig)
         if not isinstance(local_attn_size, int) and hasattr(local_attn_size, "__iter__"):
@@ -207,197 +189,6 @@ class CausalWanSelfAttention(nn.Module):
 
         return final_k, final_v
 
-    def reset_tcat_ema(self):
-        """Reset TCAT EMA state. Call this when starting a new video."""
-        self.tcat_prev_scores_sink = None
-        self.tcat_prev_scores_mem = None
-        self.tcat_prev_scores_local = None
-
-    # TCAT v2: Temporal Coverage Aware Top-k Sparse Attention
-    def tcat_routing_attention(
-        self,
-        query: torch.Tensor,
-        k_sink: torch.Tensor,
-        v_sink: torch.Tensor,
-        k_mem: torch.Tensor,
-        v_mem: torch.Tensor,
-        k_local: torch.Tensor,
-        v_local: torch.Tensor,
-        chunk_size: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        TCAT v2: Per-region top-k selection with EMA smoothing.
-
-        Key improvements over v1:
-        1. Preserves Local-near (last N chunks) without selection
-        2. EMA smoothing for score stability across steps
-
-        Args:
-            query: [B, L_q, H, D]
-            k_sink, v_sink: Sink region K/V [B, L_sink, H, D]
-            k_mem, v_mem: Memory region K/V [B, L_mem, H, D]
-            k_local, v_local: Local region K/V [B, L_local, H, D]
-            chunk_size: Tokens per chunk (1560 = 1 frame)
-
-        Returns:
-            (k_selected, v_selected): Selected K/V with temporal order preserved
-        """
-        B, L_q, H, D = query.shape
-
-        # === Step 1: Split Local into Local-far and Local-near ===
-        num_local_chunks = k_local.shape[1] // chunk_size if k_local.shape[1] >= chunk_size else 0
-        local_near_chunks = min(self.tcat_local_near, num_local_chunks)
-        local_far_chunks = num_local_chunks - local_near_chunks
-
-        # Local-near: last N chunks (preserved, no selection)
-        if local_near_chunks > 0:
-            split_point = local_far_chunks * chunk_size
-            k_local_far = k_local[:, :split_point] if split_point > 0 else k_local[:, :0]
-            v_local_far = v_local[:, :split_point] if split_point > 0 else v_local[:, :0]
-            k_local_near = k_local[:, split_point:]
-            v_local_near = v_local[:, split_point:]
-        else:
-            k_local_far = k_local
-            v_local_far = v_local
-            k_local_near = k_local[:, :0]
-            v_local_near = v_local[:, :0]
-
-        # === Step 2: Define regions for selection (excluding Local-near) ===
-        regions = [
-            (k_sink, v_sink, self.tcat_sink_k, "sink"),
-            (k_mem, v_mem, self.tcat_mem_k, "mem"),
-            (k_local_far, v_local_far, self.tcat_local_k, "local"),
-        ]
-
-        # Fallback: any remainder -> keep all
-        lengths = [k.shape[1] for k, _, _, _ in regions]
-        if any(L > 0 and (L % chunk_size != 0) for L in lengths):
-            return (torch.cat([k_sink, k_mem, k_local], dim=1),
-                    torch.cat([v_sink, v_mem, v_local], dim=1))
-
-        num_chunks_list = [L // chunk_size for L in lengths]
-        total_chunks = sum(num_chunks_list)
-        total_k = self.tcat_sink_k + self.tcat_mem_k + self.tcat_local_k
-
-        # If too few chunks, keep all
-        if total_chunks == 0 or total_chunks <= total_k:
-            return (torch.cat([k_sink, k_mem, k_local], dim=1),
-                    torch.cat([v_sink, v_mem, v_local], dim=1))
-
-        # === Step 3: Compute query descriptor ===
-        phi_q = query.mean(dim=1, keepdim=True).permute(0, 2, 1, 3)  # [B, H, 1, D]
-
-        # === Step 4: Compute scores and apply EMA per region ===
-        prev_scores_map = {
-            "sink": self.tcat_prev_scores_sink,
-            "mem": self.tcat_prev_scores_mem,
-            "local": self.tcat_prev_scores_local,
-        }
-
-        scores_all_list = []
-        k_chunks_all_list = []
-        v_chunks_all_list = []
-        base_idx_list = []
-        base_total = 0
-        offset = 0
-
-        for (k_region, v_region, top_k, region_name), num_chunks in zip(regions, num_chunks_list):
-            if num_chunks == 0:
-                continue
-
-            k_chunks = k_region.view(B, num_chunks, chunk_size, H, D)
-            v_chunks = v_region.view(B, num_chunks, chunk_size, H, D)
-
-            # Compute chunk descriptors and scores
-            phi_k = k_chunks.mean(dim=2).permute(0, 2, 1, 3)  # [B, H, num_chunks, D]
-            scores = torch.matmul(phi_q, phi_k.transpose(-2, -1)).squeeze(2)  # [B, H, num_chunks]
-            scores = scores.mean(dim=1)  # [B, num_chunks]
-
-            # Apply EMA smoothing
-            prev_scores = prev_scores_map[region_name]
-            if self.tcat_ema_alpha > 0 and prev_scores is not None:
-                if prev_scores.shape == scores.shape:
-                    scores = self.tcat_ema_alpha * scores + (1 - self.tcat_ema_alpha) * prev_scores
-
-            # Update EMA state
-            if region_name == "sink":
-                self.tcat_prev_scores_sink = scores.detach()
-            elif region_name == "mem":
-                self.tcat_prev_scores_mem = scores.detach()
-            else:
-                self.tcat_prev_scores_local = scores.detach()
-
-            scores_all_list.append(scores)
-            k_chunks_all_list.append(k_chunks)
-            v_chunks_all_list.append(v_chunks)
-
-            # Per-region top-k selection
-            k_select = min(top_k, num_chunks)
-            base_total += k_select
-            if k_select > 0:
-                _, top_k_idx = torch.topk(scores, k=k_select, dim=-1)
-                base_idx_list.append(top_k_idx + offset)
-
-            offset += num_chunks
-
-        if not scores_all_list:
-            return (torch.cat([k_sink, k_mem, k_local], dim=1),
-                    torch.cat([v_sink, v_mem, v_local], dim=1))
-
-        base_idx = torch.cat(base_idx_list, dim=1) if base_idx_list else None
-
-        # === Step 5: Allocate leftover quota ===
-        scores_all = torch.cat(scores_all_list, dim=1)
-        leftover = total_k - base_total
-        remaining = total_chunks - base_total
-
-        if leftover > 0 and remaining > 0:
-            leftover = min(leftover, remaining)
-            scores_masked = scores_all.clone()
-            if base_idx is not None and base_idx.numel() > 0:
-                scores_masked = scores_masked.scatter(1, base_idx, float("-inf"))
-            _, extra_idx = torch.topk(scores_masked, k=leftover, dim=-1)
-            if base_idx is not None and base_idx.numel() > 0:
-                final_idx = torch.cat([base_idx, extra_idx], dim=-1)
-            else:
-                final_idx = extra_idx
-        else:
-            final_idx = base_idx
-
-        if final_idx is None or final_idx.numel() == 0:
-            return (torch.cat([k_sink, k_mem, k_local], dim=1),
-                    torch.cat([v_sink, v_mem, v_local], dim=1))
-
-        # Sort indices to preserve temporal order
-        final_idx_sorted, _ = torch.sort(final_idx, dim=-1)
-
-        if DEBUG:
-            print(f"[TCAT v2] Selected {final_idx_sorted.shape[1]} chunks: {final_idx_sorted[0].tolist()}")
-            print(f"[TCAT v2] Local-near preserved: {local_near_chunks} chunks")
-
-        # === Step 6: Gather selected chunks ===
-        k_chunks_all = torch.cat(k_chunks_all_list, dim=1)
-        v_chunks_all = torch.cat(v_chunks_all_list, dim=1)
-
-        k_chunks_p = k_chunks_all.permute(0, 3, 1, 2, 4)  # [B, H, total_chunks, chunk_size, D]
-        v_chunks_p = v_chunks_all.permute(0, 3, 1, 2, 4)
-
-        expanded_idx = final_idx_sorted.unsqueeze(1).expand(-1, H, -1)
-        expanded_idx = expanded_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, chunk_size, D)
-        sel_k = torch.gather(k_chunks_p, 2, expanded_idx)
-        sel_v = torch.gather(v_chunks_p, 2, expanded_idx)
-
-        L_sel = final_idx_sorted.shape[1] * chunk_size
-        sel_k = sel_k.reshape(B, H, L_sel, D).permute(0, 2, 1, 3)
-        sel_v = sel_v.reshape(B, H, L_sel, D).permute(0, 2, 1, 3)
-
-        # === Step 7: Concatenate with Local-near (preserved) ===
-        if k_local_near.shape[1] > 0:
-            sel_k = torch.cat([sel_k, k_local_near], dim=1)
-            sel_v = torch.cat([sel_v, v_local_near], dim=1)
-
-        return sel_k, sel_v
-
     def forward(
         self,
         x,
@@ -412,6 +203,8 @@ class CausalWanSelfAttention(nn.Module):
         update_bank=None,
         is_recache=None,
         iam_bank_length=0,  # P0 优化: 避免在 forward 中调用 .item()
+        hsa_keep_ratio_override=None,
+        force_sma=False,
     ):
         r"""
         Args:
@@ -683,9 +476,22 @@ class CausalWanSelfAttention(nn.Module):
                     k_bank = bank_k[:, :local_end_index_bank_]
                     v_bank = bank_v[:, :local_end_index_bank_]
 
+                    # chunk-level override: force SMA (typically for prompt chunk0)
+                    if force_sma:
+                        k_global = torch.cat([k_sink, k_bank], dim=1)
+                        v_global = torch.cat([v_sink, v_bank], dim=1)
+                        k_global, v_global = self.dynamic_topk_routing_attention(
+                            query=roped_query,
+                            key=k_global,
+                            value=v_global,
+                            chunk_size=1560,
+                            top_k=3
+                        )
+                        k_cat = torch.cat([k_global, k_local], dim=1)
+                        v_cat = torch.cat([v_global, v_local], dim=1)
                     # HSA: Hierarchical Sparse Attention
                     # First chunk (current_start == 0) stays dense for stability.
-                    if self.hsa_enabled and current_start > 0:
+                    elif self.hsa_enabled and current_start > 0:
                         frame_tokens = frame_seqlen
                         if k_sink.shape[1] >= frame_tokens:
                             k_sink_fixed = k_sink[:, :frame_tokens]
@@ -750,7 +556,11 @@ class CausalWanSelfAttention(nn.Module):
                             value=v_sparse_pool,
                             frame_tokens=frame_tokens,
                             block_size=self.hsa_block_size,
-                            keep_ratio=self.hsa_block_keep_ratio,
+                            keep_ratio=(
+                                self.hsa_block_keep_ratio
+                                if hsa_keep_ratio_override is None
+                                else float(max(0.0, min(1.0, hsa_keep_ratio_override)))
+                            ),
                             min_blocks=self.hsa_block_min_blocks,
                         )
 
@@ -762,18 +572,6 @@ class CausalWanSelfAttention(nn.Module):
                         if k_cat.shape[1] == 0:
                             k_cat = torch.cat([k_sink, k_bank, k_local], dim=1)
                             v_cat = torch.cat([v_sink, v_bank, v_local], dim=1)
-                    # TCAT: Temporal Coverage Aware Top-k (per-region selection)
-                    elif self.tcat_enabled:
-                        k_cat, v_cat = self.tcat_routing_attention(
-                            query=roped_query,
-                            k_sink=k_sink,
-                            v_sink=v_sink,
-                            k_mem=k_bank,
-                            v_mem=v_bank,
-                            k_local=k_local,
-                            v_local=v_local,
-                            chunk_size=1560,
-                        )
                     # SMA: 稀疏注意力 (与 MemFlow 保持一致)
                     elif self.SMA:
                         # Sink + Bank 稀疏化，Local 保留全部
@@ -839,19 +637,12 @@ class CausalWanAttentionBlock(nn.Module):
                  record_interval=3,
                  SMA=False,
                  sparse_top_k=6,
-                 # TCAT parameters
-                 tcat_enabled=False,
-                 tcat_sink_k=1,
-                 tcat_mem_k=2,
-                 tcat_local_k=3,
-                 tcat_local_near=3,
-                 tcat_ema_alpha=0.3,
                  # HSA parameters
                  hsa_enabled=False,
                  hsa_frame_top_k=2,
                  hsa_frame_min_sink=1,
                  hsa_frame_min_mem=1,
-                 hsa_local_far_frames=3,
+                 hsa_local_far_frames=6,
                  hsa_local_near_frames=3,
                  hsa_block_size=64,
                  hsa_block_keep_ratio=0.35,
@@ -870,10 +661,11 @@ class CausalWanAttentionBlock(nn.Module):
         self.self_attn = CausalWanSelfAttention(
             dim, num_heads, local_attn_size, sink_size, qk_norm, eps,
             record_interval, SMA, sparse_top_k,
-            tcat_enabled, tcat_sink_k, tcat_mem_k, tcat_local_k, tcat_local_near, tcat_ema_alpha,
-            hsa_enabled, hsa_frame_top_k, hsa_frame_min_sink, hsa_frame_min_mem,
-            hsa_local_far_frames, hsa_local_near_frames, hsa_block_size,
-            hsa_block_keep_ratio, hsa_block_min_blocks
+            hsa_enabled=hsa_enabled, hsa_frame_top_k=hsa_frame_top_k,
+            hsa_frame_min_sink=hsa_frame_min_sink, hsa_frame_min_mem=hsa_frame_min_mem,
+            hsa_local_far_frames=hsa_local_far_frames, hsa_local_near_frames=hsa_local_near_frames,
+            hsa_block_size=hsa_block_size, hsa_block_keep_ratio=hsa_block_keep_ratio,
+            hsa_block_min_blocks=hsa_block_min_blocks
         )
         self.norm3 = WanLayerNorm(
             dim, eps,
@@ -910,6 +702,8 @@ class CausalWanAttentionBlock(nn.Module):
         q_bank=None,
         is_recache=None,
         iam_bank_length=0,
+        hsa_keep_ratio_override=None,
+        force_sma=False,
         # SPT parameters
         prev_crossattn_cache=None,
         transition_alpha=None,
@@ -933,7 +727,9 @@ class CausalWanAttentionBlock(nn.Module):
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
             freqs, block_mask, kv_cache, current_start, cache_start, kv_bank, update_bank, is_recache,
-            iam_bank_length=iam_bank_length)  # P0 优化
+            iam_bank_length=iam_bank_length,
+            hsa_keep_ratio_override=hsa_keep_ratio_override,
+            force_sma=force_sma)  # P0 优化
         
         if kv_cache is not None:
             y, cache_update_info = self_attn_result
@@ -1031,19 +827,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  record_interval=3,
                  SMA=False,
                  sparse_top_k=6,
-                 # TCAT parameters
-                 tcat_enabled=False,
-                 tcat_sink_k=1,
-                 tcat_mem_k=2,
-                 tcat_local_k=3,
-                 tcat_local_near=3,
-                 tcat_ema_alpha=0.3,
                  # HSA parameters
                  hsa_enabled=False,
                  hsa_frame_top_k=2,
                  hsa_frame_min_sink=1,
                  hsa_frame_min_mem=1,
-                 hsa_local_far_frames=3,
+                 hsa_local_far_frames=6,
                  hsa_local_near_frames=3,
                  hsa_block_size=64,
                  hsa_block_keep_ratio=0.35,
@@ -1129,10 +918,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 cross_attn_type, dim, ffn_dim, num_heads,
                 local_attn_size, sink_size, bank_size, qk_norm, cross_attn_norm, eps,
                 record_interval, SMA, sparse_top_k,
-                tcat_enabled, tcat_sink_k, tcat_mem_k, tcat_local_k, tcat_local_near, tcat_ema_alpha,
-                hsa_enabled, hsa_frame_top_k, hsa_frame_min_sink, hsa_frame_min_mem,
-                hsa_local_far_frames, hsa_local_near_frames, hsa_block_size,
-                hsa_block_keep_ratio, hsa_block_min_blocks
+                hsa_enabled=hsa_enabled, hsa_frame_top_k=hsa_frame_top_k,
+                hsa_frame_min_sink=hsa_frame_min_sink, hsa_frame_min_mem=hsa_frame_min_mem,
+                hsa_local_far_frames=hsa_local_far_frames, hsa_local_near_frames=hsa_local_near_frames,
+                hsa_block_size=hsa_block_size, hsa_block_keep_ratio=hsa_block_keep_ratio,
+                hsa_block_min_blocks=hsa_block_min_blocks
             )
             for _ in range(num_layers)
         ])
@@ -1464,6 +1254,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         update_cache: bool = True,
         is_recache: bool = False,
         iam_bank_length: int = 0,
+        hsa_keep_ratio_override: float = None,
+        force_sma: bool = False,
         # SPT (Soft Prompt Transition) parameters
         prev_crossattn_cache: dict = None,
         transition_alpha: float = None,
@@ -1554,6 +1346,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             is_recache=is_recache,
             update_bank=update_bank,
             iam_bank_length=iam_bank_length,
+            hsa_keep_ratio_override=hsa_keep_ratio_override,
+            force_sma=force_sma,
             transition_alpha=transition_alpha,
         )
         # print("kwargs done")
