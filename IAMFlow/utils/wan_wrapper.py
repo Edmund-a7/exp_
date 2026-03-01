@@ -151,6 +151,11 @@ class WanDiffusionWrapper(torch.nn.Module):
             hsa_block_size=64,
             hsa_block_keep_ratio=0.35,
             hsa_block_min_blocks=1,
+            hsa_ratio_offset_sink_fixed=0.45,
+            hsa_ratio_offset_sink_sel=0.15,
+            hsa_ratio_offset_mem_sel=0.30,
+            hsa_ratio_offset_local_far=-0.10,
+            hsa_spatial_partition_enabled=False,
     ):
         super().__init__()
 
@@ -172,6 +177,11 @@ class WanDiffusionWrapper(torch.nn.Module):
                 hsa_block_size=hsa_block_size,
                 hsa_block_keep_ratio=hsa_block_keep_ratio,
                 hsa_block_min_blocks=hsa_block_min_blocks,
+                hsa_ratio_offset_sink_fixed=hsa_ratio_offset_sink_fixed,
+                hsa_ratio_offset_sink_sel=hsa_ratio_offset_sink_sel,
+                hsa_ratio_offset_mem_sel=hsa_ratio_offset_mem_sel,
+                hsa_ratio_offset_local_far=hsa_ratio_offset_local_far,
+                hsa_spatial_partition_enabled=hsa_spatial_partition_enabled,
             )
         else:
             self.model = WanModel.from_pretrained(f"{WAN_MODEL_PATH}/")
