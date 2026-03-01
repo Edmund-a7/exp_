@@ -94,7 +94,8 @@ class CausalWanSelfAttention(nn.Module):
                  hsa_ratio_offset_sink_fixed=0.45,
                  hsa_ratio_offset_sink_sel=0.15,
                  hsa_ratio_offset_mem_sel=0.30,
-                 hsa_ratio_offset_local_far=-0.10):
+                 hsa_ratio_offset_local_far=-0.10,
+                 hsa_spatial_partition_enabled=False):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -121,6 +122,24 @@ class CausalWanSelfAttention(nn.Module):
         self.hsa_ratio_offset_sink_sel = hsa_ratio_offset_sink_sel
         self.hsa_ratio_offset_mem_sel = hsa_ratio_offset_mem_sel
         self.hsa_ratio_offset_local_far = hsa_ratio_offset_local_far
+        self.hsa_spatial_partition_enabled = hsa_spatial_partition_enabled
+
+        # Build spatial partition config (default: 3 regions with 0.3:0.4:0.3 weights)
+        if self.hsa_spatial_partition_enabled:
+            # NOTE: Assumes frame_tokens=1560 (480p: 30h x 52w latent grid)
+            # For other resolutions, region boundaries should be adjusted accordingly
+            _FRAME_TOKENS = 1560
+            blocks_per_frame = int(math.ceil(_FRAME_TOKENS / self.hsa_block_size))  # 25 for block_size=64
+            self.hsa_spatial_partition_config = {
+                'enabled': True,
+                'regions': [
+                    (0, 8, 0.3),                    # Upper region: blocks 0-7 (~top 33%)
+                    (8, 17, 0.4),                   # Middle region: blocks 8-16 (~middle 37%)
+                    (17, blocks_per_frame, 0.3),    # Lower region: blocks 17-24 (~bottom 30%)
+                ]
+            }
+        else:
+            self.hsa_spatial_partition_config = None
 
         # Support list/tuple local_attn_size by converting to list first (handles OmegaConf ListConfig)
         if not isinstance(local_attn_size, int) and hasattr(local_attn_size, "__iter__"):
@@ -590,6 +609,7 @@ class CausalWanSelfAttention(nn.Module):
                             keep_ratio=base_ratio,
                             min_blocks=self.hsa_block_min_blocks,
                             per_frame_keep_ratio=per_frame_kr,
+                            spatial_partition_config=self.hsa_spatial_partition_config,
                         )
 
                         # Append local-near as dense safeguard.
@@ -678,7 +698,8 @@ class CausalWanAttentionBlock(nn.Module):
                  hsa_ratio_offset_sink_fixed=0.45,
                  hsa_ratio_offset_sink_sel=0.15,
                  hsa_ratio_offset_mem_sel=0.30,
-                 hsa_ratio_offset_local_far=-0.10):
+                 hsa_ratio_offset_local_far=-0.10,
+                 hsa_spatial_partition_enabled=False):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -702,6 +723,7 @@ class CausalWanAttentionBlock(nn.Module):
             hsa_ratio_offset_sink_sel=hsa_ratio_offset_sink_sel,
             hsa_ratio_offset_mem_sel=hsa_ratio_offset_mem_sel,
             hsa_ratio_offset_local_far=hsa_ratio_offset_local_far,
+            hsa_spatial_partition_enabled=hsa_spatial_partition_enabled,
         )
         self.norm3 = WanLayerNorm(
             dim, eps,
@@ -877,6 +899,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  hsa_ratio_offset_sink_sel=0.15,
                  hsa_ratio_offset_mem_sel=0.30,
                  hsa_ratio_offset_local_far=-0.10,
+                 hsa_spatial_partition_enabled=False,
                  qk_norm=True,
                  cross_attn_norm=True,
                  eps=1e-6):
@@ -967,6 +990,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 hsa_ratio_offset_sink_sel=hsa_ratio_offset_sink_sel,
                 hsa_ratio_offset_mem_sel=hsa_ratio_offset_mem_sel,
                 hsa_ratio_offset_local_far=hsa_ratio_offset_local_far,
+                hsa_spatial_partition_enabled=hsa_spatial_partition_enabled,
             )
             for _ in range(num_layers)
         ])

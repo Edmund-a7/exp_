@@ -170,6 +170,7 @@ def select_top_blocks_shared(
     min_blocks: int = 1,
     max_blocks: int = 0,
     per_frame_keep_ratio: List[float] = None,
+    spatial_partition_config: dict = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
     """
     Select top-k blocks shared across batch by score.
@@ -178,6 +179,14 @@ def select_top_blocks_shared(
     each frame uses its own keep ratio for independent per-frame top-k
     selection.  Otherwise falls back to the original global top-k with
     *keep_ratio*.
+
+    When *spatial_partition_config* is provided along with per_frame_keep_ratio,
+    applies spatial partitioning within each frame to ensure spatial balance.
+    Config format: {
+        'enabled': bool,
+        'regions': [(start_block, end_block, weight), ...],
+        # e.g., [(0, 8, 0.3), (8, 17, 0.4), (17, 25, 0.3)]
+    }
 
     Returns:
         (selected_k, selected_v, selected_block_indices)
@@ -248,23 +257,81 @@ def select_top_blocks_shared(
             q_desc.view(B, 1, 1, D) * key_block_desc
         ).sum(dim=-1).mean(dim=0)  # [F, BP]
 
-        # Group frames by n_keep (derived from ratio) — typically only 4 groups.
-        from collections import defaultdict
-        groups = defaultdict(list)  # n_keep -> [frame_indices]
-        for f in range(num_frames):
-            ratio_f = float(per_frame_keep_ratio[f])
-            n_keep = max(1, min(blocks_per_frame, int(math.ceil(blocks_per_frame * ratio_f))))
-            groups[n_keep].append(f)
+        # Check if spatial partitioning is enabled
+        use_spatial_partition = (
+            spatial_partition_config is not None
+            and spatial_partition_config.get('enabled', False)
+            and 'regions' in spatial_partition_config
+        )
 
-        selected_idx = []
-        for n_keep, frame_list in groups.items():
-            batch_scores = frame_scores[frame_list]          # [G, BP]
-            top_indices = torch.topk(batch_scores, k=n_keep, dim=1).indices  # [G, n_keep]
-            # Convert to flat block indices: frame_idx * blocks_per_frame + block_idx
-            offsets = torch.tensor(frame_list, device=top_indices.device).unsqueeze(1) * blocks_per_frame
-            flat = (top_indices + offsets).reshape(-1)
-            selected_idx.extend(flat.tolist())
-        selected_idx.sort()
+        if use_spatial_partition:
+            # Spatial partition path: per-frame + per-region topk
+            # Optimization: group frames by (region_id, quota) for batched topk
+            regions = spatial_partition_config['regions']
+
+            # Step 1: Compute quotas for all frames
+            frame_quotas = []  # [(frame_idx, [(start, end, n_keep), ...]), ...]
+            for f in range(num_frames):
+                ratio_f = float(per_frame_keep_ratio[f])
+                n_keep_total = max(1, min(blocks_per_frame, int(math.ceil(blocks_per_frame * ratio_f))))
+
+                # Distribute quota across spatial regions
+                quotas = []
+                allocated = 0
+                for i, (start_block, end_block, weight) in enumerate(regions):
+                    n_blocks_in_region = end_block - start_block
+                    if i == len(regions) - 1:
+                        n_keep_region = n_keep_total - allocated
+                    else:
+                        n_keep_region = int(round(n_keep_total * weight))
+
+                    if n_keep_region <= 0:
+                        continue
+
+                    n_keep_region = min(n_keep_region, n_blocks_in_region)
+                    quotas.append((start_block, end_block, n_keep_region))
+                    allocated += n_keep_region
+
+                frame_quotas.append((f, quotas))
+
+            # Step 2: Group by (region_bounds, n_keep) for batched topk
+            from collections import defaultdict
+            groups = defaultdict(list)  # (start, end, n_keep) -> [frame_indices]
+            for f, quotas in frame_quotas:
+                for start_block, end_block, n_keep_region in quotas:
+                    groups[(start_block, end_block, n_keep_region)].append(f)
+
+            # Step 3: Batched topk per group
+            selected_idx = []
+            for (start_block, end_block, n_keep_region), frame_list in groups.items():
+                # Extract scores for this region across all frames in group
+                batch_scores = frame_scores[frame_list, start_block:end_block]  # [G, region_size]
+                top_indices = torch.topk(batch_scores, k=n_keep_region, dim=1).indices  # [G, n_keep]
+
+                # Convert to global block indices
+                for i, f in enumerate(frame_list):
+                    global_indices = top_indices[i] + start_block + f * blocks_per_frame
+                    selected_idx.extend(global_indices.tolist())
+
+            selected_idx.sort()
+        else:
+            # Original grouped batch topk (no spatial partition)
+            from collections import defaultdict
+            groups = defaultdict(list)  # n_keep -> [frame_indices]
+            for f in range(num_frames):
+                ratio_f = float(per_frame_keep_ratio[f])
+                n_keep = max(1, min(blocks_per_frame, int(math.ceil(blocks_per_frame * ratio_f))))
+                groups[n_keep].append(f)
+
+            selected_idx = []
+            for n_keep, frame_list in groups.items():
+                batch_scores = frame_scores[frame_list]          # [G, BP]
+                top_indices = torch.topk(batch_scores, k=n_keep, dim=1).indices  # [G, n_keep]
+                # Convert to flat block indices: frame_idx * blocks_per_frame + block_idx
+                offsets = torch.tensor(frame_list, device=top_indices.device).unsqueeze(1) * blocks_per_frame
+                flat = (top_indices + offsets).reshape(-1)
+                selected_idx.extend(flat.tolist())
+            selected_idx.sort()
     else:
         # Original global top-k path
         key_block_desc_flat = key_block_desc.reshape(B, num_blocks, D)

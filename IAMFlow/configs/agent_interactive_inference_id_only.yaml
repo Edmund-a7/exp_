@@ -27,6 +27,8 @@ model_kwargs:
   hsa_block_size: 64
   hsa_block_keep_ratio: 0.35
   hsa_block_min_blocks: 1
+  # HSA spatial partition: prevent spatial drift by ensuring balanced block selection across regions
+  hsa_spatial_partition_enabled: true
 
 # Inference
 data_path: prompts/interactive_example.jsonl
