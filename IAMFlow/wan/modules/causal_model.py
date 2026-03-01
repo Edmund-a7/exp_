@@ -90,7 +90,11 @@ class CausalWanSelfAttention(nn.Module):
                  hsa_local_near_frames=3,
                  hsa_block_size=64,
                  hsa_block_keep_ratio=0.35,
-                 hsa_block_min_blocks=1):
+                 hsa_block_min_blocks=1,
+                 hsa_ratio_offset_sink_fixed=0.45,
+                 hsa_ratio_offset_sink_sel=0.15,
+                 hsa_ratio_offset_mem_sel=0.30,
+                 hsa_ratio_offset_local_far=-0.10):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -113,6 +117,10 @@ class CausalWanSelfAttention(nn.Module):
         self.hsa_block_size = hsa_block_size
         self.hsa_block_keep_ratio = hsa_block_keep_ratio
         self.hsa_block_min_blocks = hsa_block_min_blocks
+        self.hsa_ratio_offset_sink_fixed = hsa_ratio_offset_sink_fixed
+        self.hsa_ratio_offset_sink_sel = hsa_ratio_offset_sink_sel
+        self.hsa_ratio_offset_mem_sel = hsa_ratio_offset_mem_sel
+        self.hsa_ratio_offset_local_far = hsa_ratio_offset_local_far
 
         # Support list/tuple local_attn_size by converting to list first (handles OmegaConf ListConfig)
         if not isinstance(local_attn_size, int) and hasattr(local_attn_size, "__iter__"):
@@ -360,9 +368,9 @@ class CausalWanSelfAttention(nn.Module):
                 local_end_index_bank = bank_local_end + current_end_bank - bank_global_end
                 local_start_index_bank = local_end_index_bank - num_new_tokens//3
 
-                bank_k = kv_bank["k"].clone()
-                bank_v = kv_bank["v"].clone()
-                
+                bank_k = kv_bank["k"]
+                bank_v = kv_bank["v"]
+
                 # Apply rolling update to the temporary cache
                 temp_k[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                     temp_k[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
@@ -414,8 +422,8 @@ class CausalWanSelfAttention(nn.Module):
                 local_end_index_bank = bank_local_end + current_end_bank - bank_global_end
                 local_start_index_bank = local_end_index_bank - num_new_tokens//3
 
-                bank_k = kv_bank["k"].clone()
-                bank_v = kv_bank["v"].clone()
+                bank_k = kv_bank["k"]
+                bank_v = kv_bank["v"]
                 # Protect sink_tokens only during recomputation; regular forward generation allows writing into the initial sink region
                 write_start_index = max(local_start_index, sink_tokens) if is_recompute else local_start_index
                 write_start_index_bank = local_start_index_bank
@@ -547,21 +555,41 @@ class CausalWanSelfAttention(nn.Module):
                             near_frames=self.hsa_local_near_frames,
                         )
 
-                        # Block-level selection on [selected 3 frames + local-far].
+                        # Block-level selection on [selected frames + local-far].
                         k_sparse_pool = torch.cat([k_selected_frames, k_local_far], dim=1)
                         v_sparse_pool = torch.cat([v_selected_frames, v_local_far], dim=1)
+
+                        # Per-region differentiated keep_ratio:
+                        #   sink_fixed  -> base + 0.45  (anchor, preserve most)
+                        #   sink_sel    -> base + 0.15
+                        #   mem_sel     -> base + 0.30  (entity frames from IAM bank)
+                        #   local_far   -> base - 0.10  (redundant recent context)
+                        base_ratio = (
+                            self.hsa_block_keep_ratio
+                            if hsa_keep_ratio_override is None
+                            else float(max(0.0, min(1.0, hsa_keep_ratio_override)))
+                        )
+                        n_sink_fixed = k_sink_fixed.shape[1] // frame_tokens
+                        n_sink_sel = len(sink_idx)
+                        n_mem_sel = len(mem_idx)
+                        n_local_far = k_local_far.shape[1] // frame_tokens
+
+                        per_frame_kr = (
+                            [min(1.0, base_ratio + self.hsa_ratio_offset_sink_fixed)] * n_sink_fixed
+                            + [min(1.0, base_ratio + self.hsa_ratio_offset_sink_sel)] * n_sink_sel
+                            + [min(1.0, base_ratio + self.hsa_ratio_offset_mem_sel)] * n_mem_sel
+                            + [max(0.1, base_ratio + self.hsa_ratio_offset_local_far)] * n_local_far
+                        )
+
                         k_sparse, v_sparse, _ = select_top_blocks_shared(
                             query=roped_query,
                             key=k_sparse_pool,
                             value=v_sparse_pool,
                             frame_tokens=frame_tokens,
                             block_size=self.hsa_block_size,
-                            keep_ratio=(
-                                self.hsa_block_keep_ratio
-                                if hsa_keep_ratio_override is None
-                                else float(max(0.0, min(1.0, hsa_keep_ratio_override)))
-                            ),
+                            keep_ratio=base_ratio,
                             min_blocks=self.hsa_block_min_blocks,
+                            per_frame_keep_ratio=per_frame_kr,
                         )
 
                         # Append local-near as dense safeguard.
@@ -646,7 +674,11 @@ class CausalWanAttentionBlock(nn.Module):
                  hsa_local_near_frames=3,
                  hsa_block_size=64,
                  hsa_block_keep_ratio=0.35,
-                 hsa_block_min_blocks=1):
+                 hsa_block_min_blocks=1,
+                 hsa_ratio_offset_sink_fixed=0.45,
+                 hsa_ratio_offset_sink_sel=0.15,
+                 hsa_ratio_offset_mem_sel=0.30,
+                 hsa_ratio_offset_local_far=-0.10):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -665,7 +697,11 @@ class CausalWanAttentionBlock(nn.Module):
             hsa_frame_min_sink=hsa_frame_min_sink, hsa_frame_min_mem=hsa_frame_min_mem,
             hsa_local_far_frames=hsa_local_far_frames, hsa_local_near_frames=hsa_local_near_frames,
             hsa_block_size=hsa_block_size, hsa_block_keep_ratio=hsa_block_keep_ratio,
-            hsa_block_min_blocks=hsa_block_min_blocks
+            hsa_block_min_blocks=hsa_block_min_blocks,
+            hsa_ratio_offset_sink_fixed=hsa_ratio_offset_sink_fixed,
+            hsa_ratio_offset_sink_sel=hsa_ratio_offset_sink_sel,
+            hsa_ratio_offset_mem_sel=hsa_ratio_offset_mem_sel,
+            hsa_ratio_offset_local_far=hsa_ratio_offset_local_far,
         )
         self.norm3 = WanLayerNorm(
             dim, eps,
@@ -837,6 +873,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  hsa_block_size=64,
                  hsa_block_keep_ratio=0.35,
                  hsa_block_min_blocks=1,
+                 hsa_ratio_offset_sink_fixed=0.45,
+                 hsa_ratio_offset_sink_sel=0.15,
+                 hsa_ratio_offset_mem_sel=0.30,
+                 hsa_ratio_offset_local_far=-0.10,
                  qk_norm=True,
                  cross_attn_norm=True,
                  eps=1e-6):
@@ -922,7 +962,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 hsa_frame_min_sink=hsa_frame_min_sink, hsa_frame_min_mem=hsa_frame_min_mem,
                 hsa_local_far_frames=hsa_local_far_frames, hsa_local_near_frames=hsa_local_near_frames,
                 hsa_block_size=hsa_block_size, hsa_block_keep_ratio=hsa_block_keep_ratio,
-                hsa_block_min_blocks=hsa_block_min_blocks
+                hsa_block_min_blocks=hsa_block_min_blocks,
+                hsa_ratio_offset_sink_fixed=hsa_ratio_offset_sink_fixed,
+                hsa_ratio_offset_sink_sel=hsa_ratio_offset_sink_sel,
+                hsa_ratio_offset_mem_sel=hsa_ratio_offset_mem_sel,
+                hsa_ratio_offset_local_far=hsa_ratio_offset_local_far,
             )
             for _ in range(num_layers)
         ])

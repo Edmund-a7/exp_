@@ -756,23 +756,19 @@ class MemoryBank:
             # 扩展一点范围，因为 tokenization 可能跨越边界
             start_token = max(0, int((start_ratio - 0.02) * num_tokens))
             end_token = min(num_tokens, int((end_ratio + 0.02) * num_tokens))
+            weights[start_token:end_token] = torch.clamp(
+                weights[start_token:end_token], min=entity_weight
+            )
 
-            # 应用权重（取最大值，避免重叠区域被覆盖）
-            for i in range(start_token, end_token):
-                weights[i] = max(weights[i].item(), entity_weight)
-
-        # 对非实体区域稍微降权
-        # 特别是开头的场景描述和结尾的镜头描述
+        # 对非实体区域稍微降权（向量化）
         scene_end = int(num_tokens * 0.08)
         camera_start = int(num_tokens * 0.92)
 
-        for i in range(scene_end):
-            if weights[i] == base_weight:  # 只降权未被标记为实体的部分
-                weights[i] = 0.7
+        head_mask = weights[:scene_end] == base_weight
+        weights[:scene_end] = torch.where(head_mask, torch.tensor(0.7), weights[:scene_end])
 
-        for i in range(camera_start, num_tokens):
-            if weights[i] == base_weight:
-                weights[i] = 0.5
+        tail_mask = weights[camera_start:] == base_weight
+        weights[camera_start:] = torch.where(tail_mask, torch.tensor(0.5), weights[camera_start:])
 
         print(f"[DEBUG] Entity keyword positions: {len(keyword_positions)} keywords found")
 

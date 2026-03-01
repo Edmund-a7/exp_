@@ -169,9 +169,15 @@ def select_top_blocks_shared(
     keep_ratio: float,
     min_blocks: int = 1,
     max_blocks: int = 0,
+    per_frame_keep_ratio: List[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
     """
     Select top-k blocks shared across batch by score.
+
+    When *per_frame_keep_ratio* is provided (one float per frame in key),
+    each frame uses its own keep ratio for independent per-frame top-k
+    selection.  Otherwise falls back to the original global top-k with
+    *keep_ratio*.
 
     Returns:
         (selected_k, selected_v, selected_block_indices)
@@ -192,15 +198,7 @@ def select_top_blocks_shared(
     if num_blocks == 0:
         return key[:, :0], value[:, :0], []
 
-    keep_ratio = float(keep_ratio)
-    min_blocks = max(1, int(min_blocks))
-    k_blocks = max(min_blocks, int(math.ceil(num_blocks * keep_ratio)))
-    if max_blocks and max_blocks > 0:
-        k_blocks = min(k_blocks, int(max_blocks))
-    k_blocks = min(k_blocks, num_blocks)
-
-    # Vectorized block scoring:
-    # [B, F*T, H, D] -> [B, F, T, H, D] -> pad per frame -> [B, F, BP, BS, H, D].
+    # --- Vectorized block scoring (shared for both paths) ---
     B, _, H, D = key.shape
     key_frames = key.view(B, num_frames, frame_tokens, H, D)
 
@@ -216,7 +214,6 @@ def select_top_blocks_shared(
 
     key_blocks = key_frames.view(B, num_frames, blocks_per_frame, block_size, H, D)
 
-    # Tail block has fewer valid tokens. Normalize by valid lengths per block.
     block_lengths = torch.full(
         (blocks_per_frame,),
         float(block_size),
@@ -226,33 +223,82 @@ def select_top_blocks_shared(
     tail_tokens = frame_tokens - (blocks_per_frame - 1) * block_size
     block_lengths[-1] = float(tail_tokens)
 
-    # Aggregate over token/head -> [B, F, BP, D]
     key_block_sum = key_blocks.sum(dim=3).sum(dim=3)
     denom = block_lengths.view(1, 1, blocks_per_frame, 1) * float(H)
     key_block_desc = key_block_sum / denom.to(dtype=key_block_sum.dtype)
-    key_block_desc = key_block_desc.reshape(B, num_blocks, D)
 
-    # Shared query descriptor and dot-product scores -> [num_blocks]
     q_desc = query.mean(dim=1).mean(dim=1)  # [B, D]
-    score_tensor = (q_desc.unsqueeze(1) * key_block_desc).sum(dim=-1).mean(dim=0)
 
-    top_idx = torch.topk(score_tensor, k=k_blocks).indices
-    top_idx, _ = torch.sort(top_idx)
-    selected_idx = top_idx.tolist()
+    # --- Selection ---
+    use_per_frame = False
+    if per_frame_keep_ratio is not None:
+        if len(per_frame_keep_ratio) == num_frames:
+            use_per_frame = True
+        else:
+            import warnings
+            warnings.warn(
+                f"per_frame_keep_ratio length {len(per_frame_keep_ratio)} != "
+                f"num_frames {num_frames}, falling back to global keep_ratio"
+            )
 
-    # Gather selected blocks from original (un-padded) 1-D sequence.
-    k_parts = []
-    v_parts = []
+    if use_per_frame:
+        # Per-frame top-k via grouped batch: frames sharing the same ratio
+        # are batched into a single topk call to minimise kernel launches.
+        frame_scores = (
+            q_desc.view(B, 1, 1, D) * key_block_desc
+        ).sum(dim=-1).mean(dim=0)  # [F, BP]
+
+        # Group frames by n_keep (derived from ratio) — typically only 4 groups.
+        from collections import defaultdict
+        groups = defaultdict(list)  # n_keep -> [frame_indices]
+        for f in range(num_frames):
+            ratio_f = float(per_frame_keep_ratio[f])
+            n_keep = max(1, min(blocks_per_frame, int(math.ceil(blocks_per_frame * ratio_f))))
+            groups[n_keep].append(f)
+
+        selected_idx = []
+        for n_keep, frame_list in groups.items():
+            batch_scores = frame_scores[frame_list]          # [G, BP]
+            top_indices = torch.topk(batch_scores, k=n_keep, dim=1).indices  # [G, n_keep]
+            # Convert to flat block indices: frame_idx * blocks_per_frame + block_idx
+            offsets = torch.tensor(frame_list, device=top_indices.device).unsqueeze(1) * blocks_per_frame
+            flat = (top_indices + offsets).reshape(-1)
+            selected_idx.extend(flat.tolist())
+        selected_idx.sort()
+    else:
+        # Original global top-k path
+        key_block_desc_flat = key_block_desc.reshape(B, num_blocks, D)
+        score_tensor = (
+            q_desc.unsqueeze(1) * key_block_desc_flat
+        ).sum(dim=-1).mean(dim=0)
+
+        keep_ratio = float(keep_ratio)
+        min_blocks = max(1, int(min_blocks))
+        k_blocks = max(min_blocks, int(math.ceil(num_blocks * keep_ratio)))
+        if max_blocks and max_blocks > 0:
+            k_blocks = min(k_blocks, int(max_blocks))
+        k_blocks = min(k_blocks, num_blocks)
+
+        top_idx = torch.topk(score_tensor, k=k_blocks).indices
+        top_idx, _ = torch.sort(top_idx)
+        selected_idx = top_idx.tolist()
+
+    # --- Gather selected blocks from original (un-padded) 1-D sequence ---
+    if not selected_idx:
+        return key[:, :0], value[:, :0], []
+
+    # Vectorized gather: build flat token indices for all selected blocks.
+    token_indices = []
     for idx in selected_idx:
         frame_idx = idx // blocks_per_frame
         block_idx = idx % blocks_per_frame
         frame_base = frame_idx * frame_tokens
         start = frame_base + block_idx * block_size
         end = min(start + block_size, frame_base + frame_tokens)
-        k_parts.append(key[:, start:end])
-        v_parts.append(value[:, start:end])
+        token_indices.extend(range(start, end))
 
-    if not k_parts:
-        return key[:, :0], value[:, :0], []
+    idx_tensor = torch.tensor(token_indices, device=key.device, dtype=torch.long)
+    sel_k = key[:, idx_tensor]
+    sel_v = value[:, idx_tensor]
 
-    return torch.cat(k_parts, dim=1), torch.cat(v_parts, dim=1), selected_idx
+    return sel_k, sel_v, selected_idx

@@ -11,7 +11,8 @@ IAM Agent Causal Inference Pipeline
 
 流程 (与 pipeline.md 对齐):
 1. 每个 prompt 的 chunk 1: LLM Agent 提取实体 → ID 分配/匹配 → 检索初始记忆帧
-2. chunk 3 开始: 驱逐 chunk → IAM 选帧 → 更新 top-3 记忆帧 → 注入 kv_bank
+2. chunk 1-2: 从 clean context cache 中存档当前 chunk → IAM 选帧 → 注入 kv_bank
+3. chunk 3+: 驱逐 chunk → IAM 选帧 → 更新 id_memory → 注入 kv_bank
 """
 
 import os
@@ -447,9 +448,11 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             # 记录输出
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred.to(output.device)
 
-            # ===== 5. IAM 帧选择和 bank 更新 (chunk >= 3 时) =====
-            # 关键：必须在 clean context 更新前获取被驱逐的 chunk
+            # ===== 5. IAM 帧选择和 bank 更新 =====
             self.current_chunk_id += 1
+            _did_eviction = False
+
+            # chunk >= 3: 窗口满，有被驱逐 chunk → 必须在 clean context 更新前提取
             if self.current_chunk_id >= 3 and self.current_entities:
                 if profile:
                     memory_start.record()
@@ -458,8 +461,8 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
                     current_start_frame=current_start_frame,
                     current_num_frames=current_num_frames
                 )
-                # ===== 6. 将 IAM 的帧 KV 注入 kv_bank =====
                 self._inject_iam_memory_to_bank()
+                _did_eviction = True
 
                 if profile:
                     memory_end.record()
@@ -486,6 +489,20 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
                 prev_crossattn_cache=self.prev_crossattn_cache,
                 transition_alpha=transition_alpha,
             )
+
+            # chunk 1-2: 窗口未满，无驱逐。clean context 写入后从 cache 提取当前 chunk 存档
+            if not _did_eviction and self.current_chunk_id >= 1 and self.current_entities:
+                if profile:
+                    memory_start.record()
+
+                self._process_chunk_archival(current_start_frame)
+                self._inject_iam_memory_to_bank()
+
+                if profile:
+                    memory_end.record()
+                    torch.cuda.synchronize()
+                    memory_time = memory_start.elapsed_time(memory_end)
+                    memory_times.append((f"Chunk {block_idx}", memory_time))
 
             if self.spt_enabled:
                 self._update_transition_state(current_num_frames)
@@ -766,6 +783,52 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             print(f"[AgentPipeline] IAM selected frame {frame_id} with score {score:.4f}")
             print(f"[AgentPipeline] Active memory: {self.agent_memory_bank.frame_active_memory}")
 
+    def _process_chunk_archival(self, current_start_frame: int) -> None:
+        """
+        早期 chunk (1-2) 存档：窗口未满无驱逐，从 cache 中提取当前 chunk 的 clean KV。
+        必须在 clean context update **之后**调用。
+        """
+        if not self.current_entities or self.kv_cache1 is None:
+            return
+
+        chunk_length = self.num_frame_per_block * self.frame_seq_length
+        # sink 区域之后的偏移
+        sink_tokens = getattr(self.args.model_kwargs, "sink_size", 3) * self.frame_seq_length
+
+        # 当前 chunk 在 cache 中的位置: clean context update 刚写入
+        cache = self.kv_cache1[0]
+        local_end = cache["local_end_index"].item()
+        chunk_start = max(sink_tokens, local_end - chunk_length)
+        chunk_end = local_end
+
+        if chunk_end <= chunk_start:
+            return
+
+        # 早期 chunk 窗口未满，cache 不会被 roll，view 即可（省 60 次大张量拷贝）
+        all_blocks_kv = []
+        for block_cache in self.kv_cache1:
+            all_blocks_kv.append({
+                "k": block_cache["k"][:, chunk_start:chunk_end],
+                "v": block_cache["v"][:, chunk_start:chunk_end],
+            })
+
+        entity_ids = self.agent_memory_bank.get_entity_ids(self.current_entities)
+        frame_id, score = self.agent_memory_bank.select_frame_from_chunk(
+            evicted_chunk_kv=all_blocks_kv,
+            crossattn_cache=self.crossattn_cache,
+            prompt_id=self.current_prompt_id,
+            chunk_id=self.current_chunk_id,
+            current_entity_ids=entity_ids,
+            current_entities=self.current_entities,
+            prompt_text=self.current_prompt_text,
+        )
+
+        frame_info = self.agent_memory_bank.frame_archive[frame_id]
+        self.agent_memory_bank.update_id_memory(frame_id, frame_info.entity_score)
+
+        if DEBUG:
+            print(f"[AgentPipeline] Archived frame {frame_id} (score={score:.4f}) from chunk {self.current_chunk_id}")
+
     def _get_evicted_chunk_kv(self) -> Optional[List[Dict[str, torch.Tensor]]]:
         """
         获取即将被驱逐的 chunk 的 KV cache (所有 30 个 block)
@@ -849,14 +912,15 @@ class AgentCausalInferencePipeline(InteractiveCausalInferencePipeline):
             bank = self.kv_bank1[block_idx]
             bank_size = bank["k"].shape[1]
 
-            # 清空并写入 IAM 的帧
-            bank["k"].zero_()
-            bank["v"].zero_()
-
             # 写入 IAM 选择的帧 (最多 bank_size)
             write_length = min(memory_length, bank_size)
             bank["k"][:, :write_length] = memory_kv[block_idx]["k"][:, :write_length]
             bank["v"][:, :write_length] = memory_kv[block_idx]["v"][:, :write_length]
+
+            # 只清零尾部（前缀已被覆盖，无需先 zero 再写）
+            if write_length < bank_size:
+                bank["k"][:, write_length:].zero_()
+                bank["v"][:, write_length:].zero_()
 
             # 更新索引
             bank["local_end_index"].fill_(write_length)
